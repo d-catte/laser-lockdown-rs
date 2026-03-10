@@ -1,4 +1,6 @@
 use crate::sd_utils::DummyTimeSource;
+use crate::web;
+use crate::web::User;
 use core::cell::RefCell;
 use core::fmt::Write;
 use embedded_hal_bus::spi::RefCellDevice;
@@ -13,8 +15,6 @@ use esp_hal::{
 };
 use heapless::{String, Vec};
 use static_cell::StaticCell;
-use crate::web;
-use crate::web::User;
 
 /// The implementation of the SD card IO
 pub type SdDevice =
@@ -193,7 +193,11 @@ impl SD {
 
             let file_size = file.length() as usize;
 
-            let start = if file_size > LOG_SNAPSHOT_SIZE { file_size - LOG_SNAPSHOT_SIZE } else { 0 };
+            let start = if file_size > LOG_SNAPSHOT_SIZE {
+                file_size - LOG_SNAPSHOT_SIZE
+            } else {
+                0
+            };
 
             if start > 0 {
                 file.seek_from_start(start as u32).map_err(|_| ())?;
@@ -299,16 +303,13 @@ impl SD {
     }
 
     /// Lists all users (up to 32) that are in the database
-    pub fn list_users(
-        &self,
-    ) -> Result<Vec<User, 32>, ()> {
+    pub fn list_users(&self) -> Result<Vec<User, 32>, ()> {
         self.with_root_dir(|root| {
             let mut file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
                 .map_err(|_| ())?;
 
-            let mut users: Vec<User, 32> =
-                Vec::new();
+            let mut users: Vec<User, 32> = Vec::new();
 
             while let Some(user) = Self::read_entry(&mut file)? {
                 users.push(user).map_err(|_| ())?;
@@ -343,9 +344,7 @@ impl SD {
                     return Err(()); // corrupted entry
                 }
 
-                let entry_id = u32::from_le_bytes([
-                    entry[0], entry[1], entry[2], entry[3],
-                ]);
+                let entry_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
 
                 if entry_id == id {
                     // overwrite name
@@ -471,7 +470,7 @@ impl SD {
         name.push_str(core::str::from_utf8(&name_bytes[..len]).map_err(|_| ())?)
             .map_err(|_| ())?;
 
-        Ok(Some(User {id, name}))
+        Ok(Some(User { id, name }))
     }
 }
 

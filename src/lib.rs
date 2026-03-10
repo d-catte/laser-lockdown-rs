@@ -2,13 +2,13 @@
 #![feature(impl_trait_in_assoc_type)]
 extern crate alloc;
 
+pub mod ntp;
 pub mod rfid;
 pub mod sd;
 pub mod sd_utils;
-pub mod wifi;
-pub mod web;
 pub mod signals;
-pub mod ntp;
+pub mod web;
+pub mod wifi;
 
 #[macro_export]
 macro_rules! mk_static {

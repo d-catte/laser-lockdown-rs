@@ -1,18 +1,18 @@
+use crate::signals::Command;
 use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use esp_alloc as _;
-use picoserve::{AppBuilder, AppRouter, Router, response::File, routing};
+use heapless::{String, Vec, format};
 use picoserve::request::Request;
 use picoserve::response::{IntoResponse, Json, Response, StatusCode};
-use static_cell::StaticCell;
-use heapless::{Vec, String, format};
+use picoserve::{AppBuilder, AppRouter, Router, response::File, routing};
 use rand_core::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use crate::signals::Command;
+use static_cell::StaticCell;
 
 pub static APP_STATE: StaticCell<AppState> = StaticCell::new();
 
@@ -24,10 +24,11 @@ impl AppBuilder for Application {
     type PathRouter = impl routing::PathRouter;
 
     fn build_app(self) -> Router<Self::PathRouter> {
-        Router::new().route(
-            "/",
-            routing::get_service(File::html(include_str!("index.html"))),
-        )
+        Router::new()
+            .route(
+                "/",
+                routing::get_service(File::html(include_str!("index.html"))),
+            )
             .route("/login", routing::post(login))
             .route("/logout", routing::post(logout))
             .route("/logs", routing::get(get_logs))
@@ -68,10 +69,7 @@ impl WebApp {
     pub fn new(state: &'static AppState) -> Self {
         let app = Application { state };
 
-        let router = picoserve::make_static!(
-            AppRouter<Application>,
-            app.build_app()
-        );
+        let router = picoserve::make_static!(AppRouter<Application>, app.build_app());
 
         let config = picoserve::make_static!(
             picoserve::Config<Duration>,
@@ -144,10 +142,7 @@ fn generate_session_token() -> String<64> {
 }
 
 /// Checks if the user's session token is valid
-async fn is_authenticated<R: picoserve::io::Read>(
-    app: &Application,
-    req: &Request<'_, R>,
-) -> bool {
+async fn is_authenticated<R: picoserve::io::Read>(app: &Application, req: &Request<'_, R>) -> bool {
     let state = app.state;
 
     let Some(cookie_header) = req.headers().get("Cookie") else {
@@ -176,7 +171,6 @@ async fn login<R: picoserve::io::Read>(
     app: &Application,
     mut req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     // Parse JSON body
     let body: LoginRequest = match req.json().await {
         Ok(b) => b,
@@ -203,11 +197,10 @@ async fn login<R: picoserve::io::Read>(
     drop(session);
 
     // Proper cookie response
-    Response::ok(())
-        .with_header(
-            "Set-Cookie",
-            &format!("session={}; Path=/; HttpOnly; SameSite=Strict", token),
-        )
+    Response::ok(()).with_header(
+        "Set-Cookie",
+        &format!("session={}; Path=/; HttpOnly; SameSite=Strict", token),
+    )
 }
 
 /// Invalidates the session token
@@ -218,11 +211,10 @@ async fn logout(app: &Application) -> impl IntoResponse {
     drop(session);
 
     // Expire cookie
-    Response::ok(())
-        .with_header(
-            "Set-Cookie",
-            "session=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
-        )
+    Response::ok(()).with_header(
+        "Set-Cookie",
+        "session=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
+    )
 }
 
 /// Resets the user password with a new one
@@ -230,7 +222,6 @@ async fn reset_password<R: picoserve::io::Read>(
     app: &Application,
     mut req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     let state = app.state;
 
     let body: ResetPasswordRequest = match req.json().await {
@@ -273,7 +264,6 @@ async fn get_users<R: picoserve::io::Read>(
     app: &Application,
     req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }
@@ -301,7 +291,6 @@ async fn add_user<R: picoserve::io::Read>(
     app: &Application,
     req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }
@@ -329,11 +318,14 @@ async fn update_user<R: picoserve::io::Read>(
         if user.id == body.id {
             if user.name == body.name {
                 // Don't cause unnecessary SD writing
-                break
+                break;
             }
             user.name.clear();
             user.name.push_str(&body.name).unwrap();
-            app.state.commands.signal(Command::UpdateUser { id: body.id, name: user.name.clone() });
+            app.state.commands.signal(Command::UpdateUser {
+                id: body.id,
+                name: user.name.clone(),
+            });
             break;
         }
     }
@@ -344,7 +336,6 @@ async fn remove_user<R: picoserve::io::Read>(
     app: &Application,
     mut req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }
@@ -360,7 +351,9 @@ async fn remove_user<R: picoserve::io::Read>(
     if let Some(pos) = users.iter().position(|u| u.id == body.id) {
         users.swap_remove(pos);
 
-        app.state.commands.signal(Command::RemoveUser { id: body.id });
+        app.state
+            .commands
+            .signal(Command::RemoveUser { id: body.id });
 
         StatusCode::OK
     } else {
@@ -373,7 +366,6 @@ async fn clear_users<R: picoserve::io::Read>(
     app: &Application,
     req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }
@@ -393,7 +385,6 @@ async fn get_logs<R: picoserve::io::Read>(
     app: &Application,
     req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }
@@ -413,7 +404,6 @@ async fn clear_logs<R: picoserve::io::Read>(
     app: &Application,
     req: Request<'_, R>,
 ) -> impl IntoResponse {
-
     if !is_authenticated(app, &req).await {
         return StatusCode::UNAUTHORIZED;
     }

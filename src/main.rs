@@ -6,39 +6,41 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_net::udp::PacketMetadata;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, mutex::Mutex};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::{SdCard, VolumeManager};
 use esp_backtrace as _;
+use esp_hal::peripherals::{
+    GPIO4, GPIO5, GPIO6, GPIO7, GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, SPI2, UART1,
+};
 use esp_hal::time::Rate;
 use esp_hal::{
     Blocking,
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
     interrupt::software::SoftwareInterruptControl,
+    rng::Rng,
     system::Stack,
     timer::timg::TimerGroup,
     uart::{Config, Uart},
-    rng::Rng,
 };
 use esp_hal::{
     delay::Delay as EspHalDelay,
     spi::Mode as SpiMode,
     spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
 };
-use esp_hal::peripherals::{GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, GPIO4, GPIO5, GPIO6, GPIO7, SPI2, UART1};
 use esp_rtos::embassy::Executor;
-use laser_lockdown_rs::rfid::SeeedRfid;
-use laser_lockdown_rs::{sd, web};
-use laser_lockdown_rs::sd_utils::DummyTimeSource;
-use sd::SD;
-use sd::SPI_BUS;
-use web::{APP_STATE, AppState};
-use static_cell::StaticCell;
 use heapless::{String, Vec};
 use laser_lockdown_rs::ntp::Clock;
+use laser_lockdown_rs::rfid::SeeedRfid;
+use laser_lockdown_rs::sd_utils::DummyTimeSource;
 use laser_lockdown_rs::signals::Command;
+use laser_lockdown_rs::{sd, web};
+use sd::SD;
+use sd::SPI_BUS;
+use static_cell::StaticCell;
+use web::{APP_STATE, AppState};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -73,7 +75,8 @@ async fn io(
     let mut buzzer = Output::new(gpio5, Level::Low, OutputConfig::default());
     let door_sensor = Input::new(gpio6, InputConfig::default());
     let mut door_lock = Output::new(gpio7, Level::Low, OutputConfig::default());
-    let uart1 = Uart::new(uart1, Config::default()).unwrap()
+    let uart1 = Uart::new(uart1, Config::default())
+        .unwrap()
         .with_rx(gpio18)
         .with_tx(gpio17);
     let mut keycard_reader = SeeedRfid::new(uart1, CARD_READER_DELAY);
@@ -84,7 +87,8 @@ async fn io(
                 ADD_MODE.store(false, Ordering::Relaxed);
 
                 // Check if the add mode hasn't expired
-                if Instant::now().duration_since(*ADD_MODE_ENABLED.lock().await) < MAX_ADD_MODE_TIME {
+                if Instant::now().duration_since(*ADD_MODE_ENABLED.lock().await) < MAX_ADD_MODE_TIME
+                {
                     cmd.signal(Command::AddUser { id: card_id });
 
                     let timer = Timer::after(Duration::from_millis(500));
@@ -95,13 +99,13 @@ async fn io(
                         indicator_led.set_low();
                         buzzer.set_low();
                         timer.await;
-                    }   
-                    continue
+                    }
+                    continue;
                 }
             }
 
             // Door closed
-            if door_sensor.is_high() {  
+            if door_sensor.is_high() {
                 cmd.signal(Command::IsUser { id: card_id });
                 let user_exists = user_check.wait().await;
                 if user_exists {
@@ -138,6 +142,8 @@ async fn io(
                     indicator_led.set_high();
                     buzzer.set_high();
                     timer.await;
+                    indicator_led.set_low();
+                    buzzer.set_low();
                 }
             }
         }
@@ -322,7 +328,8 @@ async fn main(spawner: Spawner) {
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
     let rng = Rng::new();
-    let stack = laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner).await;
+    let stack =
+        laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner).await;
 
     // Init IO
     esp_rtos::start_second_core(
@@ -334,37 +341,37 @@ async fn main(spawner: Spawner) {
             static EXECUTOR: StaticCell<Executor> = StaticCell::new();
             let executor = EXECUTOR.init(Executor::new());
             executor.run(|spawner| {
-                spawner.spawn(io(
-                    peripherals.GPIO4,
-                    peripherals.GPIO5,
-                    peripherals.GPIO6,
-                    peripherals.GPIO7,
-                    peripherals.UART1,
-                    peripherals.GPIO17,
-                    peripherals.GPIO18,
-                    commands,
-                    user_check,
-                )).ok();
-                spawner.spawn(sd(
-                    peripherals.GPIO10,
-                    peripherals.GPIO11,
-                    peripherals.GPIO12,
-                    peripherals.GPIO13,
-                    peripherals.SPI2,
-                    commands,
-                    user_check,
-                    state,
-                    &stack
-                )).ok();
+                spawner
+                    .spawn(io(
+                        peripherals.GPIO4,
+                        peripherals.GPIO5,
+                        peripherals.GPIO6,
+                        peripherals.GPIO7,
+                        peripherals.UART1,
+                        peripherals.GPIO17,
+                        peripherals.GPIO18,
+                        commands,
+                        user_check,
+                    ))
+                    .ok();
+                spawner
+                    .spawn(sd(
+                        peripherals.GPIO10,
+                        peripherals.GPIO11,
+                        peripherals.GPIO12,
+                        peripherals.GPIO13,
+                        peripherals.SPI2,
+                        commands,
+                        user_check,
+                        state,
+                        &stack,
+                    ))
+                    .ok();
             });
         },
     );
 
     // Init web app on main thread
     let web_app = web::WebApp::new(state);
-    let _ = web::web_task(
-        stack,
-        web_app.router,
-        web_app.config,
-    ).await;
+    let _ = web::web_task(stack, web_app.router, web_app.config).await;
 }

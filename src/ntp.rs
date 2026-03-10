@@ -1,11 +1,11 @@
 use core::net::{IpAddr, SocketAddr};
 
+use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::Stack;
 use embassy_time::{Duration, Instant};
 use heapless::String;
-use sntpc::{get_time, NtpContext, NtpTimestampGenerator};
+use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 
 /// The main timeserver. It routes clients to their local timeserver
@@ -98,18 +98,16 @@ impl<'a> Clock<'a> {
             let _ = self.sync().await;
         }
 
-        let unix = ((self.base_unix + (Instant::now() - self.synced_at).as_secs()) as i64 + 3600 * UTC_OFFSET as i64) as u64;
+        let unix = ((self.base_unix + (Instant::now() - self.synced_at).as_secs()) as i64
+            + 3600 * UTC_OFFSET as i64) as u64;
         let (year, month, day, hour, min) = Self::unix_to_datetime(unix);
         let mut s: String<15> = String::new();
         write!(
             s,
             "{:02}/{:02}/{:02} {:02}:{:02} ",
-            month,
-            day,
-            year,
-            hour,
-            min
-        ).ok();
+            month, day, year, hour, min
+        )
+        .ok();
         Ok(s)
     }
 
@@ -128,20 +126,14 @@ impl<'a> Clock<'a> {
         let mut z = days as i64 + 719468;
         let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
         let doe = z - era * 146097;
-        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
         let y = yoe + era * 400;
-        let doy = doe - (365*yoe + yoe/4 - yoe/100);
-        let mp = (5*doy + 2)/153;
-        let d = doy - (153*mp+2)/5 + 1;
-        let m = mp + if mp < 10 {3} else {-9};
-        let year = y + if m <= 2 {1} else {0};
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
 
-        (
-            year as u16,
-            m as u8,
-            d as u8,
-            hour,
-            minute,
-        )
+        (year as u16, m as u8, d as u8, hour, minute)
     }
 }

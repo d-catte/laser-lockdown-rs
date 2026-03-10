@@ -8,7 +8,7 @@ pub enum Command {
     /// Puts the device into "add mode"
     AddUserMode,
     /// Adds a user to the database with a default name
-    AddUser {id: u32},
+    AddUser { id: u32 },
     /// Removes a user with the specified id from the database
     RemoveUser { id: u32 },
     /// Updates the user data on the SD card
