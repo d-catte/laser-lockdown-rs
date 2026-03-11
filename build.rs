@@ -2,6 +2,10 @@ fn main() {
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+
+    // VARS
+    println!("cargo:rustc-env=SSID=example-wifi");
+    println!("cargo:rustc-env=PASSWORD=1234");
 }
 
 fn linker_be_nice() {

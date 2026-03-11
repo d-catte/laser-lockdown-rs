@@ -15,12 +15,13 @@ use esp_backtrace as _;
 use esp_hal::peripherals::{
     GPIO4, GPIO5, GPIO6, GPIO7, GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, SPI2, UART1,
 };
+use esp_hal::rng::{Rng, Trng, TrngSource};
+use esp_hal::sha::Sha;
 use esp_hal::time::Rate;
 use esp_hal::{
     Blocking,
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
     interrupt::software::SoftwareInterruptControl,
-    rng::Rng,
     system::Stack,
     timer::timg::TimerGroup,
     uart::{Config, Uart},
@@ -36,11 +37,11 @@ use laser_lockdown_rs::ntp::Clock;
 use laser_lockdown_rs::rfid::SeeedRfid;
 use laser_lockdown_rs::sd_utils::DummyTimeSource;
 use laser_lockdown_rs::signals::Command;
-use laser_lockdown_rs::{sd, web};
+use laser_lockdown_rs::{sd, sd_utils, web};
 use sd::SD;
 use sd::SPI_BUS;
 use static_cell::StaticCell;
-use web::{APP_STATE, AppState};
+use web::AppState;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -296,7 +297,7 @@ async fn sd(
 async fn main(spawner: Spawner) {
     // Setup
     esp_println::logger::init_logger_from_env();
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let mut peripherals = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 98767);
 
@@ -306,15 +307,24 @@ async fn main(spawner: Spawner) {
     static USER_CHECK: StaticCell<Signal<CriticalSectionRawMutex, bool>> = StaticCell::new();
     let user_check = &*USER_CHECK.init(Signal::new());
 
+    let _ = sd_utils::SHA_INSTANCE.init(Mutex::new(Sha::new(peripherals.SHA)));
+
     // Main cache
-    let state = APP_STATE.init(AppState {
-        users: Mutex::new(Vec::new()),
-        logs: Mutex::new(String::new()),
-        password_hash: Mutex::new([0u8; 32]),
-        password_salt: Mutex::new([0u8; 16]),
-        session_token: Mutex::new(None),
-        commands: *commands,
-    });
+    let trng = TrngSource::new(peripherals.RNG, peripherals.ADC1.reborrow());
+
+    let state = picoserve::make_static!(
+        AppState,
+        AppState {
+            users: Mutex::new(Vec::new()),
+            logs: Mutex::new(String::new()),
+            password_hash: Mutex::new([0u8; 32]),
+            password_salt: Mutex::new([0u8; 16]),
+            session_token: Mutex::new(None),
+            commands: *commands,
+            rand: Mutex::new(Trng::try_new().unwrap()),
+            _rng_source: trng,
+        }
+    );
 
     static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
     let app_core_stack = APP_CORE_STACK.init(Stack::new());
@@ -372,6 +382,6 @@ async fn main(spawner: Spawner) {
     );
 
     // Init web app on main thread
-    let web_app = web::WebApp::new(state);
-    let _ = web::web_task(stack, web_app.router, web_app.config).await;
+    let web_app = web::WebApp::new();
+    let _ = web::web_task(stack, web_app.router, web_app.config, state).await;
 }

@@ -1,3 +1,4 @@
+use core::fmt::Write;
 use core::net::{IpAddr, SocketAddr};
 
 use embassy_net::Stack;
@@ -112,7 +113,7 @@ impl<'a> Clock<'a> {
     }
 
     /// Converts unix time to date time: MM/DD/YY hh:mm
-    fn unix_to_datetime(mut unix: u64) -> (u16, u8, u8, u8, u8) {
+    fn unix_to_datetime(unix: u64) -> (u16, u8, u8, u8, u8) {
         const SECS_PER_DAY: u64 = 86400;
 
         let days = unix / SECS_PER_DAY;
@@ -123,7 +124,7 @@ impl<'a> Clock<'a> {
         let minute = (secs / 60) as u8;
 
         // Date conversion (Unix epoch: 1970-01-01)
-        let mut z = days as i64 + 719468;
+        let z = days as i64 + 719468;
         let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
         let doe = z - era * 146097;
         let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;

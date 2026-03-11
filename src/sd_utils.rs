@@ -1,7 +1,14 @@
+use embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::once_lock::OnceLock;
 use embassy_time::{Duration, Timer};
+use esp_hal::sha::Sha;
 
 /// Maximum number of retries for SD card operations
 pub const MAX_RETRIES: u8 = 4;
+
+/// The SD card's SHA implementation for hashing passwords
+pub static SHA_INSTANCE: OnceLock<Mutex<CriticalSectionRawMutex, Sha>> = OnceLock::new();
 
 /// Retry operations with 500ms backoff, useful for SD card initialization
 pub async fn retry_with_backoff<T, E, F, Fut>(operation_name: &str, mut operation: F) -> Option<T>

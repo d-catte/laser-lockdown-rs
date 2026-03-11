@@ -1,3 +1,5 @@
+use crate::web::routing::get_service;
+use core::fmt::Write;
 use crate::signals::Command;
 use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -5,79 +7,139 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use esp_alloc as _;
-use heapless::{String, Vec, format};
-use picoserve::request::Request;
-use picoserve::response::{IntoResponse, Json, Response, StatusCode};
-use picoserve::{AppBuilder, AppRouter, Router, response::File, routing};
-use rand_core::Rng;
+use esp_hal::rng::{Trng, TrngSource};
+use esp_hal::sha::Sha256;
+use heapless::{String, Vec};
+use nb::block;
+use picoserve::request::RequestParts;
+use picoserve::response::{IntoResponse, IntoResponseWithState, Json, Redirect, Response, StatusCode};
+use picoserve::{AppRouter, Router, response::File, routing, AppWithStateBuilder};
+use picoserve::extract::FromRequestParts;
+use picoserve::response::with_state::WithStateUpdate;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use static_cell::StaticCell;
+use crate::extractors::LoginExtract;
+use crate::sd_utils;
 
-pub static APP_STATE: StaticCell<AppState> = StaticCell::new();
+pub struct Application;
 
-pub struct Application {
-    state: &'static AppState,
-}
+impl AppWithStateBuilder for Application {
+    type State = AppState;
+    type PathRouter = impl routing::PathRouter<AppState>;
 
-impl AppBuilder for Application {
-    type PathRouter = impl routing::PathRouter;
-
-    fn build_app(self) -> Router<Self::PathRouter> {
+    fn build_app(self) -> Router<Self::PathRouter, AppState> {
+        /*
         Router::new()
             .route(
                 "/",
-                routing::get_service(File::html(include_str!("index.html"))),
+                get_service(File::html(include_str!("index.html"))),
             )
             .route("/login", routing::post(login))
-            .route("/logout", routing::post(logout))
-            .route("/logs", routing::get(get_logs))
-            .route("/clear_logs", routing::post(clear_logs))
-            .route("/users", routing::get(get_users))
-            .route("/add_user", routing::post(add_user))
-            .route("/remove_user", routing::post(remove_user))
-            .route("/update_user", routing::post(update_user))
-            .route("/clear_users", routing::post(clear_users))
-            .route("/change_password", routing::post(reset_password))
+            .route("/logout", routing::post(|Authenticated(state)| async move {
+                logout(state).await
+            }))
+            .route("/logs", routing::post(|Authenticated(state)| async move {
+                get_logs(state).await
+            }))
+            .route("/clear_logs", routing::post(|Authenticated(state)| async move {
+                clear_logs(state).await
+            }))
+            .route("/users", routing::get(|Authenticated(state)| async move {
+                get_users(state).await
+            }))
+            .route("/add_user", routing::post(|Authenticated(state)| async move {
+                add_user(state).await
+            }))
+            .route("/remove_user", routing::post(|Authenticated(state), Json(body)| async move {
+                remove_user(state, body).await
+            }))
+            .route("/update_user", routing::post(|Authenticated(state), Json(body)| async move {
+                update_user(state, body).await
+            }))
+            .route("/clear_users", routing::get(|Authenticated(state)| async move {
+                clear_users(state).await
+            }))
+            .route("/change_password", routing::post(|Authenticated(state), Json(body)| async move {
+                reset_password(state, body).await
+            }))
+
+         */
+
+        Router::new()
     }
 }
 
 /// The port that the webserver will be opened on; Typically this is port 80 for http and 443 for https
-const WEB_PORT: i32 = 80;
+const WEB_PORT: u16 = 80;
 
 pub async fn web_task(
     stack: Stack<'static>,
     router: &'static AppRouter<Application>,
-    config: &'static picoserve::Config<Duration>,
+    config: &'static picoserve::Config,
+    state: &'static AppState,
 ) -> ! {
     let mut tcp_rx_buffer = [0; 1024];
     let mut tcp_tx_buffer = [0; 1024];
     let mut http_buffer = [0; 2048];
 
-    picoserve::Server::new(router, config, &mut http_buffer)
+    picoserve::Server::new(
+        &router.shared().with_state(state),
+        &config,
+        &mut http_buffer
+    )
         .listen_and_serve(0, stack, WEB_PORT, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
         .await
         .into_never()
 }
 
+struct StateExtractor<'a>(&'a AppState);
+
+impl<'r> FromRequestParts<'r, AppState> for StateExtractor<'r> {
+    type Rejection = core::convert::Infallible;
+
+    async fn from_request_parts(
+        state: &'r AppState,
+        _parts: &RequestParts<'r>,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(state))
+    }
+}
+
+struct Authenticated<'a>(&'a AppState);
+
+impl<'r> FromRequestParts<'r, AppState> for Authenticated<'r> {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        state: &'r AppState,
+        parts: &RequestParts<'r>,
+    ) -> Result<Self, Self::Rejection> {
+
+        if is_authenticated(state, parts).await {
+            Ok(Self(state))
+        } else {
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
 pub struct WebApp {
-    pub router: &'static Router<<Application as AppBuilder>::PathRouter>,
-    pub config: &'static picoserve::Config<Duration>,
+    pub router: &'static AppRouter<Application>,
+    pub config: &'static picoserve::Config,
 }
 
 impl WebApp {
-    pub fn new(state: &'static AppState) -> Self {
-        let app = Application { state };
+    pub fn new() -> Self {
+        let app = Application {};
 
         let router = picoserve::make_static!(AppRouter<Application>, app.build_app());
 
         let config = picoserve::make_static!(
-            picoserve::Config<Duration>,
+            picoserve::Config,
             picoserve::Config::new(picoserve::Timeouts {
-                start_read_request: Some(Duration::from_secs(5)),
-                read_request: Some(Duration::from_secs(1)),
-                write: Some(Duration::from_secs(1)),
-                persistent_start_read_request: Some(Duration::from_secs(1)),
+                start_read_request: Duration::from_secs(5),
+                read_request: Duration::from_secs(1),
+                write: Duration::from_secs(1),
+                persistent_start_read_request: Duration::from_secs(1),
             })
             .keep_connection_alive()
         );
@@ -93,6 +155,8 @@ pub struct AppState {
     pub password_salt: Mutex<CriticalSectionRawMutex, [u8; 16]>,
     pub session_token: Mutex<CriticalSectionRawMutex, Option<String<64>>>,
     pub commands: Signal<CriticalSectionRawMutex, Command>,
+    pub rand: Mutex<CriticalSectionRawMutex, Trng>,
+    pub _rng_source: TrngSource<'static>,
 }
 
 pub struct User {
@@ -111,25 +175,31 @@ pub async fn valid_user(app: &AppState, id: u32) -> bool {
     false
 }
 
-// TODO A possible improvement to efficiency could be to use hardware SHA256
-/// Hashes the password using the software SHA256 algorithm
-pub fn hash_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(password.as_bytes());
-    let result = hasher.finalize();
+/// Hashes the password using the hardware SHA256 algorithm
+pub async fn hash_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {
+    let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
+    let mut hasher = sha.start::<Sha256>();
+    let mut data = salt.as_slice();
+    while !data.is_empty() {
+        data = block!(hasher.update(data)).unwrap();
+    }
 
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    let mut data = password.as_bytes();
+    while !data.is_empty() {
+        data = block!(hasher.update(data)).unwrap();
+    }
+
+    let mut output = [0u8; 32];
+    block!(hasher.finish(&mut output)).unwrap();
+
+    output
 }
 
 /// Generates a session token for the user viewing the website.
 /// This allows the user to stay logged in when sending REST requests
-fn generate_session_token() -> String<64> {
+async fn generate_session_token(app: &AppState) -> String<64> {
     let mut bytes = [0u8; 32];
-    let mut rng = rand::rng();
-    rng.fill_bytes(&mut bytes);
+    app.rand.lock().await.read(&mut bytes);
 
     let mut token: String<64> = String::new();
 
@@ -141,145 +211,96 @@ fn generate_session_token() -> String<64> {
     token
 }
 
-/// Checks if the user's session token is valid
-async fn is_authenticated<R: picoserve::io::Read>(app: &Application, req: &Request<'_, R>) -> bool {
-    let state = app.state;
-
-    let Some(cookie_header) = req.headers().get("Cookie") else {
-        return false;
-    };
-
-    let cookie_str = match core::str::from_utf8(cookie_header) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    // Look for "session="
-    if let Some(token) = cookie_str.strip_prefix("session=") {
-        let stored = state.session_token.lock().await;
-        if let Some(stored_token) = &*stored {
-            return stored_token.as_str() == token;
-        }
-    }
-
-    false
-}
-
 /// Check's if the user's password is valid.
 /// If it is, a session token is created
-async fn login<R: picoserve::io::Read>(
-    app: &Application,
-    mut req: Request<'_, R>,
+async fn login_old(
+    extract: LoginExtract<'_>
 ) -> impl IntoResponse {
-    // Parse JSON body
-    let body: LoginRequest = match req.json().await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
-    let salt = app.state.password_salt.lock().await;
-    let computed = hash_password(body.password, &*salt);
+    let state = extract.state;
+    let body = extract.body;
+    let salt = state.password_salt.lock().await;
+    let computed = hash_password(body.password, &*salt).await;
     drop(salt);
 
-    let stored = app.state.password_hash.lock().await;
+    let stored = state.password_hash.lock().await;
     let valid = *stored == computed;
     drop(stored);
 
     if !valid {
-        return StatusCode::UNAUTHORIZED;
+        return Response::empty(StatusCode::UNAUTHORIZED)
+            .with_header("Content-Type", "text/plain");
     }
 
-    // Generate session token
-    let token = generate_session_token();
+    let token = generate_session_token(&state).await;
 
-    let mut session = app.state.session_token.lock().await;
+    let mut session = state.session_token.lock().await;
     *session = Some(token.clone());
     drop(session);
 
-    // Proper cookie response
-    Response::ok(()).with_header(
-        "Set-Cookie",
-        &format!("session={}; Path=/; HttpOnly; SameSite=Strict", token),
-    )
+    let mut cookie: String<128> = String::new();
+    write!(cookie, "session={}; Path=/; HttpOnly; SameSite=Strict", token.as_str()).unwrap();
+
+    Response::empty(StatusCode::OK)
+        .with_header("Set-Cookie", cookie.as_str())
 }
 
 /// Invalidates the session token
-async fn logout(app: &Application) -> impl IntoResponse {
+async fn logout(state: &AppState) -> impl IntoResponse {
     // Clear session token on server
-    let mut session = app.state.session_token.lock().await;
+    let mut session = state.session_token.lock().await;
     *session = None;
     drop(session);
 
     // Expire cookie
-    Response::ok(()).with_header(
+    Response::empty(StatusCode::OK).with_header(
         "Set-Cookie",
-        "session=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
+        "session=deleted; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; HttpOnly; SameSite=Strict",
     )
 }
 
 /// Resets the user password with a new one
-async fn reset_password<R: picoserve::io::Read>(
-    app: &Application,
-    mut req: Request<'_, R>,
+async fn reset_password(
+    state: &AppState,
+    body: ResetPasswordRequest<'_>,
 ) -> impl IntoResponse {
-    let state = app.state;
-
-    let body: ResetPasswordRequest = match req.json().await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
 
     if body.new_password.len() < 8 {
         return StatusCode::BAD_REQUEST;
     }
 
     let mut new_salt = [0u8; 16];
+    state.rand.lock().await.read(&mut new_salt);
 
-    {
-        rand::rng().fill_bytes(&mut new_salt);
-    }
+    let new_hash = hash_password(body.new_password, &new_salt).await;
 
-    let new_hash = hash_password(body.new_password, &new_salt);
+    let mut salt_lock = state.password_salt.lock().await;
+    *salt_lock = new_salt;
 
-    {
-        let mut salt_lock = state.password_salt.lock().await;
-        *salt_lock = new_salt;
-    }
-
-    {
-        let mut hash_lock = state.password_hash.lock().await;
-        *hash_lock = new_hash;
-    }
+    let mut hash_lock = state.password_hash.lock().await;
+    *hash_lock = new_hash;
 
     state.commands.signal(Command::SetPassword {
         hash: new_hash,
-        salt: new_hash,
+        salt: new_salt,
     });
 
     StatusCode::OK
 }
 
 /// Gets a list of all allowed users in the database
-async fn get_users<R: picoserve::io::Read>(
-    app: &Application,
-    req: Request<'_, R>,
+async fn get_users(
+    state: &AppState,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let state = app.state;
+    // Convert to response format
+    let mut response_vec: Vec<UserResponse, 64> = Vec::new();
 
     // Lock users
     let users_lock = state.users.lock().await;
 
-    // Convert to response format
-    let mut response_vec: Vec<UserResponse, 64> = Vec::new();
-
     for user in users_lock.iter() {
         let _ = response_vec.push(UserResponse {
             id: user.id,
-            name: user.name.as_str(),
+            name: user.name.clone(),
         });
     }
 
@@ -287,33 +308,19 @@ async fn get_users<R: picoserve::io::Read>(
 }
 
 /// Puts the device in "add user" mode
-async fn add_user<R: picoserve::io::Read>(
-    app: &Application,
-    req: Request<'_, R>,
+async fn add_user(
+    state: &AppState,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    app.state.commands.signal(Command::AddUserMode);
+    state.commands.signal(Command::AddUserMode);
 
     StatusCode::OK
 }
 
-async fn update_user<R: picoserve::io::Read>(
-    app: &Application,
-    mut req: Request<'_, R>,
+async fn update_user(
+    state: &AppState,
+    body: UserResponse,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let body: UserResponse = match req.json().await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
-    let mut users = app.state.users.lock().await;
+    let mut users = state.users.lock().await;
     for user in users.iter_mut() {
         if user.id == body.id {
             if user.name == body.name {
@@ -322,36 +329,28 @@ async fn update_user<R: picoserve::io::Read>(
             }
             user.name.clear();
             user.name.push_str(&body.name).unwrap();
-            app.state.commands.signal(Command::UpdateUser {
+            state.commands.signal(Command::UpdateUser {
                 id: body.id,
                 name: user.name.clone(),
             });
             break;
         }
     }
+
+    StatusCode::OK
 }
 
 /// Removes the specified user from the database
-async fn remove_user<R: picoserve::io::Read>(
-    app: &Application,
-    mut req: Request<'_, R>,
+async fn remove_user(
+    state: &AppState,
+    body: RemoveUserRequest,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let body: RemoveUserRequest = match req.json().await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
-    let state = app.state;
     let mut users = state.users.lock().await;
 
     if let Some(pos) = users.iter().position(|u| u.id == body.id) {
         users.swap_remove(pos);
 
-        app.state
+        state
             .commands
             .signal(Command::RemoveUser { id: body.id });
 
@@ -362,65 +361,48 @@ async fn remove_user<R: picoserve::io::Read>(
 }
 
 /// Removes all users from the database
-async fn clear_users<R: picoserve::io::Read>(
-    app: &Application,
-    req: Request<'_, R>,
+async fn clear_users(
+    state: &AppState,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let state = app.state;
     let mut users = state.users.lock().await;
 
     users.clear();
 
-    app.state.commands.signal(Command::RemoveAllUsers);
+    state.commands.signal(Command::RemoveAllUsers);
 
     StatusCode::OK
 }
 
 /// Gets the last 4096 characters of the logs
-async fn get_logs<R: picoserve::io::Read>(
-    app: &Application,
-    req: Request<'_, R>,
+async fn get_logs(
+    state: &AppState,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let state = app.state;
-    let logs_lock = state.logs.lock().await;
-
-    let response = LogsResponse {
-        logs: logs_lock.as_str(),
+    let logs_copy = {
+        let logs_lock = state.logs.lock().await;
+        logs_lock.clone()
     };
 
-    Json(response)
+    Json(LogsResponse {
+        logs: logs_copy,
+    })
 }
 
 /// Deletes all logs
-async fn clear_logs<R: picoserve::io::Read>(
-    app: &Application,
-    req: Request<'_, R>,
+async fn clear_logs(
+    state: &AppState,
 ) -> impl IntoResponse {
-    if !is_authenticated(app, &req).await {
-        return StatusCode::UNAUTHORIZED;
-    }
-
-    let state = app.state;
     let mut logs = state.logs.lock().await;
 
     logs.clear();
 
-    app.state.commands.signal(Command::ClearLog);
+    state.commands.signal(Command::ClearLog);
 
     StatusCode::OK
 }
 
 // Request Structures
 #[derive(Deserialize)]
-struct LoginRequest<'a> {
+pub struct LoginRequest<'a> {
     password: &'a str,
 }
 
@@ -431,9 +413,9 @@ struct ResetPasswordRequest<'a> {
 }
 
 #[derive(Serialize)]
-pub struct UserResponse<'a> {
-    pub id: u32,
-    pub name: &'a str,
+pub struct UserResponse {
+    id: u32,
+    name: String<32>,
 }
 
 #[derive(Deserialize)]
@@ -442,6 +424,6 @@ pub struct RemoveUserRequest {
 }
 
 #[derive(Serialize)]
-pub struct LogsResponse<'a> {
-    pub logs: &'a str,
+pub struct LogsResponse {
+    pub logs: String<4096>,
 }

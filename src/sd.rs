@@ -30,8 +30,8 @@ pub static VOLUME_MGR: StaticCell<RefCell<VolumeManager<SdDevice, DummyTimeSourc
 /// The authorized users database
 const USERS_FILE: &str = "users.dat";
 
-/// The temporary user database created when removing a user
-const TEMP_FILE: &str = "users.new";
+/// The temporary user database created when modifying the existing database
+const TEMP_FILE: &str = "users.tmp";
 
 /// The file where all logs are stored
 const LOG_FILE: &str = "log.txt";
@@ -72,7 +72,7 @@ impl SD {
     ) -> Self {
         SD {
             spi_bus: spi_bus_ref,
-            volume_mgr,
+            volume_mgr
         }
     }
 
@@ -143,7 +143,7 @@ impl SD {
 
                 root.delete_file_in_dir(LOG_FILE).ok();
 
-                let mut new_file = root
+                let new_file = root
                     .open_file_in_dir(LOG_FILE, FileMode::ReadWriteCreateOrAppend)
                     .unwrap();
 
@@ -186,7 +186,7 @@ impl SD {
     /// Gets the latest 4096 characters, disregarding incomplete lines if cut off by the character limit
     pub fn get_log(&self) -> Result<String<LOG_SNAPSHOT_SIZE>, ()> {
         self.with_root_dir(|root| {
-            let mut file = match root.open_file_in_dir(LOG_FILE, FileMode::ReadOnly) {
+            let file = match root.open_file_in_dir(LOG_FILE, FileMode::ReadOnly) {
                 Ok(f) => f,
                 Err(_) => return Ok(String::new()),
             };
@@ -237,7 +237,7 @@ impl SD {
             // Remove old password file if it exists
             root.delete_file_in_dir(PASSWORD_FILE).ok();
 
-            let mut file = root
+            let file = root
                 .open_file_in_dir(PASSWORD_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
@@ -250,39 +250,46 @@ impl SD {
     }
 
     /// Gets the hashed password and salt from the file
-    pub fn get_password(&self) -> Result<([u8; 32], [u8; 16]), ()> {
-        self.with_root_dir(|root| {
-            let mut file = match root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly) {
-                Ok(f) => f,
-                Err(_) => {
-                    // Create default password
-                    let salt = [1u8; 16];
-                    let hash = web::hash_password(DEFAULT_PASSWORD, &salt);
+    pub async fn get_password(&self) -> Result<([u8; 32], [u8; 16]), ()> {
+        let result = self
+            .with_root_dir(|root| {
+                let file = root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly);
 
-                    self.set_password(hash, salt)?;
+                let mut hash = [0u8; 32];
+                let mut salt = [0u8; 16];
 
-                    return Ok((hash, salt));
+                match file {
+                    Ok(file) => {
+                        let read_hash = file.read(&mut hash).map_err(|_| ())?;
+                        let read_salt = file.read(&mut salt).map_err(|_| ())?;
+
+                        if read_hash != 32 || read_salt != 16 {
+                            return Err(());
+                        }
+
+                        Ok(Some((hash, salt)))
+                    }
+                    Err(_) => Ok(None),
                 }
-            };
+            })?;
 
-            let mut hash = [0u8; 32];
-            let mut salt = [0u8; 16];
+        if let Some(v) = result {
+            return Ok(v);
+        }
 
-            let read_hash = file.read(&mut hash).map_err(|_| ())?;
-            let read_salt = file.read(&mut salt).map_err(|_| ())?;
+        // File didn't exist
+        let salt = [1u8; 16];
+        let hash = web::hash_password(DEFAULT_PASSWORD, &salt).await;
 
-            if read_hash != 32 || read_salt != 16 {
-                return Err(());
-            }
+        self.set_password(hash, salt)?;
 
-            Ok((hash, salt))
-        })
+        Ok((hash, salt))
     }
 
     /// Adds a new user to the database of authorized users
     pub fn add_user(&self, id: u32) -> Result<(), ()> {
         self.with_root_dir(|root| {
-            let mut file = root
+            let file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
@@ -323,12 +330,12 @@ impl SD {
     /// **NOTE**: This is an expensive operation, use infrequently
     pub fn edit_user_name(&self, id: u32, new_name: &String<32>) -> Result<(), ()> {
         self.with_root_dir(|root| {
-            let mut old_file = root
+            let old_file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
                 .map_err(|_| ())?;
 
-            let mut new_file = root
-                .open_file_in_dir("users.tmp", FileMode::ReadWriteCreateOrAppend)
+            let new_file = root
+                .open_file_in_dir(TEMP_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
             let mut entry = [0u8; 4 + MAX_NAME_LEN];
@@ -362,8 +369,42 @@ impl SD {
 
             // Replace old file
             root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-            root.rename_file_in_dir("users.tmp", USERS_FILE)
+            
+            self.rename_file(TEMP_FILE, USERS_FILE)?;
+
+            Ok(())
+        })
+    }
+
+    /// Renames a file by copying all of its contents to a new file
+    pub fn rename_file(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), ()> {
+        self.with_root_dir(|root| {
+            let old_file = root
+                .open_file_in_dir(old_name, FileMode::ReadOnly)
                 .map_err(|_| ())?;
+
+            let new_file = root
+                .open_file_in_dir(new_name, FileMode::ReadWriteCreateOrAppend)
+                .map_err(|_| ())?;
+
+            let mut buffer = [0u8; 256];
+
+            loop {
+                let read = old_file.read(&mut buffer).map_err(|_| ())?;
+                if read == 0 {
+                    break;
+                }
+
+                new_file.write(&buffer[..read]).map_err(|_| ())?;
+            }
+
+            new_file.flush().map_err(|_| ())?;
+
+            root.delete_file_in_dir(old_name).map_err(|_| ())?;
 
             Ok(())
         })
@@ -399,32 +440,9 @@ impl SD {
             // Delete original
             root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
 
-            // Recreate original
-            let new_file = root
-                .open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrTruncate)
-                .map_err(|_| ())?;
-
-            let temp = root
-                .open_file_in_dir(TEMP_FILE, FileMode::ReadOnly)
-                .map_err(|_| ())?;
-
-            let mut copy_buf = [0u8; 128];
-
-            loop {
-                let count = temp.read(&mut copy_buf).map_err(|_| ())?;
-                if count == 0 {
-                    break;
-                }
-                new_file.write(&copy_buf[..count]).map_err(|_| ())?;
-            }
-
-            new_file.flush().map_err(|_| ())?;
-
-            drop(temp);
-            drop(new_file);
-
-            root.delete_file_in_dir(TEMP_FILE).map_err(|_| ())?;
-
+            // Rename to original file
+            self.rename_file(TEMP_FILE, USERS_FILE)?;
+            
             Ok(())
         })
     }
