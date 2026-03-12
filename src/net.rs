@@ -115,12 +115,8 @@ async fn remove_user(AuthenticatedUserID { body }: AuthenticatedUserID) -> impl 
 
 /// Gets all users in the database
 async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
-    let users = {
-        let guard = USERS.get().await.lock().await;
-        guard.clone()
-    };
-
-    picoserve::response::Json(UserResponse { users })
+    let users = USERS.get().await.lock().await.clone();
+    picoserve::response::Json(users)
 }
 
 async fn login(Form(body): Form<LoginRequest>) -> impl IntoResponse {
@@ -483,11 +479,6 @@ impl<'r, State> FromRequest<'r, State> for UserInfo {
 }
 
 #[derive(Deserialize, Serialize)]
-struct UserResponse {
-    users: Vec<UserInfo, 32>,
-}
-
-#[derive(Deserialize, Serialize)]
 pub struct UserID {
     id: u32,
 }
@@ -514,7 +505,7 @@ impl<'r, State> FromRequest<'r, State> for UserID {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct LoginRequest {
     password: String<64>,
 }
