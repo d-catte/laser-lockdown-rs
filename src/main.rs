@@ -1,12 +1,10 @@
 #![no_std]
 #![no_main]
 
-use alloc::borrow::ToOwned;
 use core::cell::RefCell;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
-use embassy_net::udp::PacketMetadata;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::RefCellDevice;
@@ -32,23 +30,21 @@ use esp_hal::{
     spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
 };
 use esp_rtos::embassy::Executor;
-use heapless::{String, Vec};
-use laser_lockdown_rs::ntp::Clock;
+use heapless::String;
 use laser_lockdown_rs::rfid::SeeedRfid;
 use laser_lockdown_rs::sd_utils::DummyTimeSource;
 use laser_lockdown_rs::signals::Command;
-use laser_lockdown_rs::{sd, sd_utils, web};
+use laser_lockdown_rs::{net, ntp, sd, sd_utils};
 use sd::SD;
 use sd::SPI_BUS;
 use static_cell::StaticCell;
-use web::AppState;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const CARD_READER_DELAY: Duration = Duration::from_secs(5);
 
 static ADD_MODE: AtomicBool = AtomicBool::new(false);
-static ADD_MODE_ENABLED: Mutex<NoopRawMutex, Instant> = Mutex::new(Instant::MIN);
+static ADD_MODE_ENABLED: Mutex<CriticalSectionRawMutex, Instant> = Mutex::new(Instant::MIN);
 const MAX_ADD_MODE_TIME: Duration = Duration::from_secs(20);
 
 #[panic_handler]
@@ -92,14 +88,14 @@ async fn io(
                 {
                     cmd.signal(Command::AddUser { id: card_id });
 
-                    let timer = Timer::after(Duration::from_millis(500));
                     for _ in 0..3 {
                         indicator_led.set_high();
                         buzzer.set_high();
-                        timer.await;
+                        Timer::after(Duration::from_millis(500)).await;
+
                         indicator_led.set_low();
                         buzzer.set_low();
-                        timer.await;
+                        Timer::after(Duration::from_millis(500)).await;
                     }
                     continue;
                 }
@@ -110,7 +106,7 @@ async fn io(
                 cmd.signal(Command::IsUser { id: card_id });
                 let user_exists = user_check.wait().await;
                 if user_exists {
-                    cmd.signal(Command::LogUser { id });
+                    cmd.signal(Command::LogUser { id: card_id });
                     door_lock.set_high();
                     // Flash light/buzzer every 0.25s
                     let mut ticker = Ticker::every(Duration::from_millis(250));
@@ -161,8 +157,8 @@ async fn sd(
     spi2: SPI2<'static>,
     cmd: &'static Signal<CriticalSectionRawMutex, Command>,
     user_check: &'static Signal<CriticalSectionRawMutex, bool>,
-    app_state: &'static AppState,
-    stack: &'static embassy_net::Stack<'static>,
+    time_request: &'static Signal<CriticalSectionRawMutex, ()>,
+    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<15>>>,
 ) {
     let cs = Output::new(gpio10, Level::High, OutputConfig::default());
     let spi_bus_config = SpiMasterConfig::default()
@@ -181,34 +177,20 @@ async fn sd(
         sd::VOLUME_MGR.init(RefCell::new(volume_mgr));
     let sd = SD::new(vol_mgr, spi_bus_ref);
 
-    // Set clock
-    static mut RX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
-    static mut RX_BUF: [u8; 1024] = [0; 1024];
-    static mut TX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
-    static mut TX_BUF: [u8; 1024] = [0; 1024];
-    let mut clock = Clock::new(
-        stack,
-        unsafe { &mut RX_META },
-        unsafe { &mut RX_BUF },
-        unsafe { &mut TX_META },
-        unsafe { &mut TX_BUF },
-    );
-    clock.sync().await.unwrap();
-
     // Set user cache
     if let Ok(users) = sd.list_users() {
-        *app_state.users.lock().await = users;
+        let _ = net::USERS.init(Mutex::new(users));
     }
 
     // Set log cache
     if let Ok(log) = sd.get_log() {
-        *app_state.logs.lock().await = log;
+        let _ = net::LOGS.init(Mutex::new(log));
     }
 
     // Set password cache
-    if let Ok((hash, salt)) = sd.get_password() {
-        *app_state.password_hash.lock().await = hash;
-        *app_state.password_salt.lock().await = salt;
+    if let Ok((hash, salt)) = sd.get_password().await {
+        let _ = net::PSWD.init(Mutex::new(hash));
+        let _ = net::SALT.init(Mutex::new(salt));
     }
 
     let mut logging_buffer: String<64> = String::new();
@@ -220,7 +202,9 @@ async fn sd(
             Command::ClearLog => {
                 let result = sd.clear_log();
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         sd.append(date, "Failed to clear log.", &mut logging_buffer);
                     }
                 }
@@ -232,7 +216,9 @@ async fn sd(
             Command::AddUser { id } => {
                 let result = sd.add_user(id);
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         msg_buffer.clear();
                         msg_buffer.push_str("Failed to add ").unwrap();
                         write!(msg_buffer, "{}", id).unwrap();
@@ -243,7 +229,9 @@ async fn sd(
             Command::RemoveUser { id } => {
                 let result = sd.remove_user(id);
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         msg_buffer.clear();
                         msg_buffer.push_str("Failed to remove ").unwrap();
                         write!(msg_buffer, "{}", id).unwrap();
@@ -254,7 +242,9 @@ async fn sd(
             Command::UpdateUser { id, name } => {
                 let result = sd.edit_user_name(id, &name);
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         msg_buffer.clear();
                         msg_buffer.push_str("Failed to edit ").unwrap();
                         write!(msg_buffer, "{}", id).unwrap();
@@ -265,24 +255,30 @@ async fn sd(
             Command::RemoveAllUsers => {
                 let result = sd.remove_all_users();
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         sd.append(date, "Failed to remove users.", &mut logging_buffer);
                     }
                 }
             }
             Command::IsUser { id } => {
-                user_check.signal(web::valid_user(app_state, id));
+                user_check.signal(net::valid_user(id).await);
             }
             Command::SetPassword { hash, salt } => {
                 let result = sd.set_password(hash, salt);
                 if result.is_err() {
-                    if let Ok(date) = clock.now().await {
+                    time_request.signal(());
+                    let response = time_response.wait().await;
+                    if let Some(date) = response {
                         sd.append(date, "Failed to set password.", &mut logging_buffer);
                     }
                 }
             }
             Command::LogUser { id } => {
-                if let Ok(date) = clock.now().await {
+                time_request.signal(());
+                let response = time_response.wait().await;
+                if let Some(date) = response {
                     msg_buffer.clear();
                     msg_buffer.push_str("Accessed: ").unwrap();
                     write!(msg_buffer, "{}", id).unwrap();
@@ -297,7 +293,7 @@ async fn sd(
 async fn main(spawner: Spawner) {
     // Setup
     esp_println::logger::init_logger_from_env();
-    let mut peripherals = esp_hal::init(esp_hal::Config::default());
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 98767);
 
@@ -307,24 +303,18 @@ async fn main(spawner: Spawner) {
     static USER_CHECK: StaticCell<Signal<CriticalSectionRawMutex, bool>> = StaticCell::new();
     let user_check = &*USER_CHECK.init(Signal::new());
 
+    static TIME_REQUEST: StaticCell<Signal<CriticalSectionRawMutex, ()>> = StaticCell::new();
+    let time_request = &*TIME_REQUEST.init(Signal::new());
+    static TIME_RESPONSE: StaticCell<Signal<CriticalSectionRawMutex, Option<String<15>>>> =
+        StaticCell::new();
+    let time_response = &*TIME_RESPONSE.init(Signal::new());
+
     let _ = sd_utils::SHA_INSTANCE.init(Mutex::new(Sha::new(peripherals.SHA)));
 
-    // Main cache
-    let trng = TrngSource::new(peripherals.RNG, peripherals.ADC1.reborrow());
-
-    let state = picoserve::make_static!(
-        AppState,
-        AppState {
-            users: Mutex::new(Vec::new()),
-            logs: Mutex::new(String::new()),
-            password_hash: Mutex::new([0u8; 32]),
-            password_salt: Mutex::new([0u8; 16]),
-            session_token: Mutex::new(None),
-            commands: *commands,
-            rand: Mutex::new(Trng::try_new().unwrap()),
-            _rng_source: trng,
-        }
-    );
+    // Set caches
+    let _ = net::_RNG_SOURCE.init(TrngSource::new(peripherals.RNG, peripherals.ADC1));
+    let _ = net::CMD.init(commands);
+    let _ = net::RAND.init(Mutex::new(Trng::try_new().unwrap()));
 
     static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
     let app_core_stack = APP_CORE_STACK.init(Stack::new());
@@ -338,8 +328,10 @@ async fn main(spawner: Spawner) {
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
     let rng = Rng::new();
-    let stack =
-        laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner).await;
+    static STACK_CELL: StaticCell<embassy_net::Stack<'static>> = StaticCell::new();
+    let stack: &'static mut embassy_net::Stack<'static> = STACK_CELL.init(
+        laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner).await,
+    );
 
     // Init IO
     esp_rtos::start_second_core(
@@ -373,15 +365,19 @@ async fn main(spawner: Spawner) {
                         peripherals.SPI2,
                         commands,
                         user_check,
-                        state,
-                        &stack,
+                        time_request,
+                        time_response,
                     ))
                     .ok();
             });
         },
     );
 
+    // Manage clock
+    spawner
+        .spawn(ntp::start_clock(time_request, time_response, stack))
+        .ok();
+
     // Init web app on main thread
-    let web_app = web::WebApp::new();
-    let _ = web::web_task(stack, web_app.router, web_app.config, state).await;
+    net::start_web_server(*stack).await;
 }

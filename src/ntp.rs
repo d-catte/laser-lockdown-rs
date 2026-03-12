@@ -1,9 +1,12 @@
+#![allow(static_mut_refs)]
 use core::fmt::Write;
 use core::net::{IpAddr, SocketAddr};
 
 use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 use heapless::String;
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
@@ -136,5 +139,31 @@ impl<'a> Clock<'a> {
         let year = y + if m <= 2 { 1 } else { 0 };
 
         (year as u16, m as u8, d as u8, hour, minute)
+    }
+}
+
+#[embassy_executor::task]
+pub async fn start_clock(
+    time_request: &'static Signal<CriticalSectionRawMutex, ()>,
+    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<15>>>,
+    stack: &'static Stack<'static>,
+) {
+    // Set clock
+    static mut RX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
+    static mut RX_BUF: [u8; 1024] = [0; 1024];
+    static mut TX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
+    static mut TX_BUF: [u8; 1024] = [0; 1024];
+    let mut clock = Clock::new(
+        stack,
+        unsafe { &mut RX_META },
+        unsafe { &mut RX_BUF },
+        unsafe { &mut TX_META },
+        unsafe { &mut TX_BUF },
+    );
+    clock.sync().await.unwrap();
+
+    loop {
+        let _ = time_request.wait().await;
+        time_response.signal(clock.now().await.ok());
     }
 }

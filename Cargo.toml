@@ -30,6 +30,7 @@ sntpc = { version = "0.8.1", default-features = false }
 sntpc-net-embassy = { version = "0.8.0", default-features = false }
 static_cell = "2.1.1"
 nb = "1.1.0"
+serde-json-core = "0.6.0"
 
 [profile.dev]
 # Rust debug is too slow.

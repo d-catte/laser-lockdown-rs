@@ -1,6 +1,6 @@
+use crate::net;
+use crate::net::UserInfo;
 use crate::sd_utils::DummyTimeSource;
-use crate::web;
-use crate::web::User;
 use core::cell::RefCell;
 use core::fmt::Write;
 use embedded_hal_bus::spi::RefCellDevice;
@@ -72,7 +72,7 @@ impl SD {
     ) -> Self {
         SD {
             spi_bus: spi_bus_ref,
-            volume_mgr
+            volume_mgr,
         }
     }
 
@@ -171,7 +171,7 @@ impl SD {
     /// Appends to the log with a timestamp
     pub fn append(&self, time: String<15>, message: &str, buffer: &mut String<64>) {
         buffer.clear();
-        write!(buffer, "{},{}\n", time, message).ok();
+        writeln!(buffer, "{},{}", time, message).ok();
         self.append_to_log("Failed to clear log");
     }
 
@@ -193,11 +193,7 @@ impl SD {
 
             let file_size = file.length() as usize;
 
-            let start = if file_size > LOG_SNAPSHOT_SIZE {
-                file_size - LOG_SNAPSHOT_SIZE
-            } else {
-                0
-            };
+            let start = file_size.saturating_sub(LOG_SNAPSHOT_SIZE);
 
             if start > 0 {
                 file.seek_from_start(start as u32).map_err(|_| ())?;
@@ -251,27 +247,26 @@ impl SD {
 
     /// Gets the hashed password and salt from the file
     pub async fn get_password(&self) -> Result<([u8; 32], [u8; 16]), ()> {
-        let result = self
-            .with_root_dir(|root| {
-                let file = root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly);
+        let result = self.with_root_dir(|root| {
+            let file = root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly);
 
-                let mut hash = [0u8; 32];
-                let mut salt = [0u8; 16];
+            let mut hash = [0u8; 32];
+            let mut salt = [0u8; 16];
 
-                match file {
-                    Ok(file) => {
-                        let read_hash = file.read(&mut hash).map_err(|_| ())?;
-                        let read_salt = file.read(&mut salt).map_err(|_| ())?;
+            match file {
+                Ok(file) => {
+                    let read_hash = file.read(&mut hash).map_err(|_| ())?;
+                    let read_salt = file.read(&mut salt).map_err(|_| ())?;
 
-                        if read_hash != 32 || read_salt != 16 {
-                            return Err(());
-                        }
-
-                        Ok(Some((hash, salt)))
+                    if read_hash != 32 || read_salt != 16 {
+                        return Err(());
                     }
-                    Err(_) => Ok(None),
+
+                    Ok(Some((hash, salt)))
                 }
-            })?;
+                Err(_) => Ok(None),
+            }
+        })?;
 
         if let Some(v) = result {
             return Ok(v);
@@ -279,7 +274,7 @@ impl SD {
 
         // File didn't exist
         let salt = [1u8; 16];
-        let hash = web::hash_password(DEFAULT_PASSWORD, &salt).await;
+        let hash = net::hash_password(DEFAULT_PASSWORD, &salt).await;
 
         self.set_password(hash, salt)?;
 
@@ -310,13 +305,13 @@ impl SD {
     }
 
     /// Lists all users (up to 32) that are in the database
-    pub fn list_users(&self) -> Result<Vec<User, 32>, ()> {
+    pub fn list_users(&self) -> Result<Vec<UserInfo, 32>, ()> {
         self.with_root_dir(|root| {
             let mut file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
                 .map_err(|_| ())?;
 
-            let mut users: Vec<User, 32> = Vec::new();
+            let mut users: Vec<UserInfo, 32> = Vec::new();
 
             while let Some(user) = Self::read_entry(&mut file)? {
                 users.push(user).map_err(|_| ())?;
@@ -369,7 +364,7 @@ impl SD {
 
             // Replace old file
             root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-            
+
             self.rename_file(TEMP_FILE, USERS_FILE)?;
 
             Ok(())
@@ -377,11 +372,7 @@ impl SD {
     }
 
     /// Renames a file by copying all of its contents to a new file
-    pub fn rename_file(
-        &self,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<(), ()> {
+    pub fn rename_file(&self, old_name: &str, new_name: &str) -> Result<(), ()> {
         self.with_root_dir(|root| {
             let old_file = root
                 .open_file_in_dir(old_name, FileMode::ReadOnly)
@@ -426,7 +417,7 @@ impl SD {
             while let Some(user) = Self::read_entry(&mut original)? {
                 if user.id != id {
                     temp.write(&user.id.to_le_bytes()).map_err(|_| ())?;
-                    temp.write(&user.name.as_bytes()).map_err(|_| ())?;
+                    temp.write(user.name.as_bytes()).map_err(|_| ())?;
                 } else {
                     break;
                 }
@@ -442,7 +433,7 @@ impl SD {
 
             // Rename to original file
             self.rename_file(TEMP_FILE, USERS_FILE)?;
-            
+
             Ok(())
         })
     }
@@ -458,7 +449,7 @@ impl SD {
     /// Gets the next entry in the authorized users database
     fn read_entry(
         file: &mut embedded_sdmmc::File<SdDevice, DummyTimeSource, 4, 4, 1>,
-    ) -> Result<Option<User>, ()> {
+    ) -> Result<Option<UserInfo>, ()> {
         let mut entry = [0u8; 4 + MAX_NAME_LEN];
 
         let read = file.read(&mut entry).map_err(|_| ())?;
@@ -488,7 +479,7 @@ impl SD {
         name.push_str(core::str::from_utf8(&name_bytes[..len]).map_err(|_| ())?)
             .map_err(|_| ())?;
 
-        Ok(Some(User { id, name }))
+        Ok(Some(UserInfo { id, name }))
     }
 }
 
