@@ -103,10 +103,11 @@ async fn io(
 
             // Door closed
             if door_sensor.is_high() {
-                cmd.signal(Command::IsUser { id: card_id });
+                let hashed_id = net::hash_id(card_id).await;
+                cmd.signal(Command::IsUser { id: hashed_id });
                 let user_exists = user_check.wait().await;
                 if user_exists {
-                    cmd.signal(Command::LogUser { id: card_id });
+                    cmd.signal(Command::LogUser { id: hashed_id });
 
                     door_open.set_high();
                     // TODO Determine how long it takes to open/close the door
@@ -241,7 +242,7 @@ async fn sd(
                     if let Some(date) = response {
                         msg_buffer.clear();
                         msg_buffer.push_str("Failed to remove ").unwrap();
-                        write!(msg_buffer, "{}", id).unwrap();
+                        write!(msg_buffer, "{:?}", id).unwrap();
                         sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
                     }
                 }
@@ -254,7 +255,7 @@ async fn sd(
                     if let Some(date) = response {
                         msg_buffer.clear();
                         msg_buffer.push_str("Failed to edit ").unwrap();
-                        write!(msg_buffer, "{}", id).unwrap();
+                        write!(msg_buffer, "{:?}", id).unwrap();
                         sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
                     }
                 }
@@ -288,7 +289,7 @@ async fn sd(
                 if let Some(date) = response {
                     msg_buffer.clear();
                     msg_buffer.push_str("Accessed: ").unwrap();
-                    write!(msg_buffer, "{}", id).unwrap();
+                    write!(msg_buffer, "{:?}", id).unwrap();
                     sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
                 }
             }

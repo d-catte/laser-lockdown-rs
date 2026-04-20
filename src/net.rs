@@ -122,7 +122,7 @@ async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
 async fn login(Form(body): Form<LoginRequest>) -> impl IntoResponse {
     // Compute hash
     let computed = {
-        hash_password(&body.password, &SALT).await
+        hash_password(&body.password).await
     };
 
     // Compare with stored hash
@@ -173,15 +173,38 @@ async fn logout(_auth: AuthenticatedUser) -> impl IntoResponse {
 }
 
 /// Hashes the password using the hardware SHA256 algorithm
-pub async fn hash_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {
+pub async fn hash_password(password: &str) -> [u8; 32] {
     let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
     let mut hasher = sha.start::<Sha256>();
-    let mut data = salt.as_slice();
+    let mut data = SALT.as_slice();
     while !data.is_empty() {
         data = block!(hasher.update(data)).unwrap();
     }
 
     let mut data = password.as_bytes();
+    while !data.is_empty() {
+        data = block!(hasher.update(data)).unwrap();
+    }
+
+    let mut output = [0u8; 32];
+    block!(hasher.finish(&mut output)).unwrap();
+
+    output
+}
+
+/// Hashes the user's id so that it can be stored securely on the SD card
+pub async fn hash_id(value: u32) -> [u8; 32] {
+    let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
+    let mut hasher = sha.start::<Sha256>();
+
+    let mut salt_data = SALT.as_slice();
+    while !salt_data.is_empty() {
+        salt_data = block!(hasher.update(salt_data)).unwrap();
+    }
+
+    let val_bytes = value.to_be_bytes();
+    let mut data = &val_bytes[..];
+
     while !data.is_empty() {
         data = block!(hasher.update(data)).unwrap();
     }
@@ -212,7 +235,7 @@ async fn generate_session_token() -> String<64> {
 async fn change_password(
     AuthenticatedLoginRequest { body }: AuthenticatedLoginRequest,
 ) -> impl IntoResponse {
-    let new_hash = hash_password(body.password.as_str(), &SALT).await;
+    let new_hash = hash_password(body.password.as_str()).await;
 
     {
         let mut hash_lock = PSWD.get().await.lock().await;
@@ -440,7 +463,7 @@ impl<'r, State> FromRequest<'r, State> for AuthenticatedLoginRequest {
 // Forms
 #[derive(Deserialize, Serialize, Clone)]
 pub struct UserInfo {
-    pub(crate) id: u32,
+    pub(crate) id: [u8; 32],
     pub(crate) name: String<32>,
 }
 
@@ -468,7 +491,7 @@ impl<'r, State> FromRequest<'r, State> for UserInfo {
 
 #[derive(Deserialize, Serialize)]
 pub struct UserID {
-    id: u32,
+    id: [u8; 32],
 }
 
 impl<'r, State> FromRequest<'r, State> for UserID {
@@ -522,7 +545,7 @@ impl<'r, State> FromRequest<'r, State> for LoginRequest {
 
 // API
 /// If the user is contained in the user cache
-pub async fn valid_user(id: u32) -> bool {
+pub async fn valid_user(id: [u8; 32]) -> bool {
     let users = USERS.get().await.lock().await;
     users.iter().any(|u| u.id == id)
 }

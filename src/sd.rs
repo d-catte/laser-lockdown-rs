@@ -1,5 +1,5 @@
 use crate::net;
-use crate::net::{UserInfo, SALT};
+use crate::net::UserInfo;
 use crate::sd_utils::DummyTimeSource;
 use core::cell::RefCell;
 use core::fmt::Write;
@@ -270,7 +270,7 @@ impl SD {
         }
 
         // File didn't exist
-        let hash = net::hash_password(DEFAULT_PASSWORD, &SALT).await;
+        let hash = net::hash_password(DEFAULT_PASSWORD).await;
 
         self.set_password(hash)?;
 
@@ -278,26 +278,27 @@ impl SD {
     }
 
     /// Adds a new user to the database of authorized users
-    pub fn add_user(&self, id: u32) -> Result<(), ()> {
-        self.with_root_dir(|root| {
+    pub async fn add_user(&self, id: u32) -> Result<(), ()> {
+        self.with_root_dir(async |root| {
             let file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
-            let mut entry = [0u8; 4 + MAX_NAME_LEN];
+            let mut entry = [0u8; 32 + MAX_NAME_LEN];
 
             // ID
-            entry[..4].copy_from_slice(&id.to_le_bytes());
+            let hashed_id = net::hash_id(id).await;
+            entry[..32].copy_from_slice(&hashed_id);
 
             // Name
             let name_bytes = DEFAULT_NEW_USER.as_bytes();
-            entry[4..4 + name_bytes.len()].copy_from_slice(name_bytes);
+            entry[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
 
             file.write(&entry).map_err(|_| ())?;
             file.flush().map_err(|_| ())?;
 
             Ok(())
-        })
+        }).await
     }
 
     /// Lists all users (up to 32) that are in the database
@@ -319,7 +320,7 @@ impl SD {
 
     /// Replaces a user's name with the specified id.
     /// **NOTE**: This is an expensive operation, use infrequently
-    pub fn edit_user_name(&self, id: u32, new_name: &String<32>) -> Result<(), ()> {
+    pub fn edit_user_name(&self, id: [u8; 32], new_name: &String<32>) -> Result<(), ()> {
         self.with_root_dir(|root| {
             let old_file = root
                 .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
@@ -329,7 +330,8 @@ impl SD {
                 .open_file_in_dir(TEMP_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
-            let mut entry = [0u8; 4 + MAX_NAME_LEN];
+            const ENTRY_SIZE: usize = 32 + MAX_NAME_LEN;
+            let mut entry = [0u8; ENTRY_SIZE];
 
             loop {
                 let read = old_file.read(&mut entry).map_err(|_| ())?;
@@ -338,19 +340,19 @@ impl SD {
                     break;
                 }
 
-                if read != entry.len() {
-                    return Err(()); // corrupted entry
+                if read != ENTRY_SIZE {
+                    return Err(()); // Corrupted entry
                 }
 
-                let entry_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                if entry[..32] == id {
 
-                if entry_id == id {
-                    // overwrite name
                     let mut name_buf = [0u8; MAX_NAME_LEN];
                     let name_bytes = new_name.as_bytes();
-                    name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
 
-                    entry[4..].copy_from_slice(&name_buf);
+                    let copy_len = name_bytes.len().min(MAX_NAME_LEN);
+                    name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+                    entry[32..].copy_from_slice(&name_buf);
                 }
 
                 new_file.write(&entry).map_err(|_| ())?;
@@ -358,9 +360,7 @@ impl SD {
 
             new_file.flush().map_err(|_| ())?;
 
-            // Replace old file
             root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-
             self.rename_file(TEMP_FILE, USERS_FILE)?;
 
             Ok(())
@@ -398,7 +398,7 @@ impl SD {
     }
 
     /// Removes a user from the authorized users database
-    pub fn remove_user(&self, id: u32) -> Result<(), ()> {
+    pub fn remove_user(&self, id: [u8; 32]) -> Result<(), ()> {
         self.with_root_dir(|root| {
             let mut original = match root.open_file_in_dir(USERS_FILE, FileMode::ReadOnly) {
                 Ok(f) => f,
@@ -412,7 +412,7 @@ impl SD {
             // Copy all except target ID
             while let Some(user) = Self::read_entry(&mut original)? {
                 if user.id != id {
-                    temp.write(&user.id.to_le_bytes()).map_err(|_| ())?;
+                    temp.write(&user.id).map_err(|_| ())?;
                     temp.write(user.name.as_bytes()).map_err(|_| ())?;
                 } else {
                     break;
@@ -446,7 +446,9 @@ impl SD {
     fn read_entry(
         file: &mut embedded_sdmmc::File<SdDevice, DummyTimeSource, 4, 4, 1>,
     ) -> Result<Option<UserInfo>, ()> {
-        let mut entry = [0u8; 4 + MAX_NAME_LEN];
+        // Size: 32 bytes (Hash) + MAX_NAME_LEN
+        const ENTRY_SIZE: usize = 32 + MAX_NAME_LEN;
+        let mut entry = [0u8; ENTRY_SIZE];
 
         let read = file.read(&mut entry).map_err(|_| ())?;
 
@@ -454,15 +456,16 @@ impl SD {
             return Ok(None);
         }
 
-        if read < entry.len() {
-            return Err(()); // corrupted file
+        if read < ENTRY_SIZE {
+            return Err(()); // Corrupted file or EOF reached early
         }
 
-        // Extract ID
-        let id = u32::from_le_bytes(entry[..4].try_into().unwrap());
+        // Extract the Hashed ID (the first 32 bytes)
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&entry[0..32]);
 
-        // Extract name bytes
-        let name_bytes = &entry[4..4 + MAX_NAME_LEN];
+        // Extract name bytes (starting at index 32)
+        let name_bytes = &entry[32..32 + MAX_NAME_LEN];
 
         // Find real length (remove zero padding)
         let len = name_bytes
@@ -470,10 +473,9 @@ impl SD {
             .position(|b| *b == 0)
             .unwrap_or(MAX_NAME_LEN);
 
-        // Convert to String<32>
         let mut name: String<32> = String::new();
-        name.push_str(core::str::from_utf8(&name_bytes[..len]).map_err(|_| ())?)
-            .map_err(|_| ())?;
+        let name_str = core::str::from_utf8(&name_bytes[..len]).map_err(|_| ())?;
+        name.push_str(name_str).map_err(|_| ())?;
 
         Ok(Some(UserInfo { id, name }))
     }
