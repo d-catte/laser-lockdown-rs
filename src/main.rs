@@ -10,9 +10,7 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::{SdCard, VolumeManager};
 use esp_backtrace as _;
-use esp_hal::peripherals::{
-    GPIO4, GPIO5, GPIO6, GPIO7, GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, SPI2, UART1,
-};
+use esp_hal::peripherals::{GPIO4, GPIO5, GPIO6, GPIO7, GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, SPI2, UART1, GPIO8};
 use esp_hal::rng::{Rng, Trng, TrngSource};
 use esp_hal::sha::Sha;
 use esp_hal::time::Rate;
@@ -61,6 +59,7 @@ async fn io(
     gpio5: GPIO5<'static>,
     gpio6: GPIO6<'static>,
     gpio7: GPIO7<'static>,
+    gpio8: GPIO8<'static>,
     uart1: UART1<'static>,
     gpio17: GPIO17<'static>,
     gpio18: GPIO18<'static>,
@@ -71,7 +70,8 @@ async fn io(
     let mut indicator_led = Output::new(gpio4, Level::Low, OutputConfig::default());
     let mut buzzer = Output::new(gpio5, Level::Low, OutputConfig::default());
     let door_sensor = Input::new(gpio6, InputConfig::default());
-    let mut door_lock = Output::new(gpio7, Level::Low, OutputConfig::default());
+    let mut door_open = Output::new(gpio7, Level::Low, OutputConfig::default());
+    let mut door_close = Output::new(gpio8, Level::Low, OutputConfig::default());
     let uart1 = Uart::new(uart1, Config::default())
         .unwrap()
         .with_rx(gpio18)
@@ -107,7 +107,12 @@ async fn io(
                 let user_exists = user_check.wait().await;
                 if user_exists {
                     cmd.signal(Command::LogUser { id: card_id });
-                    door_lock.set_high();
+
+                    door_open.set_high();
+                    // TODO Determine how long it takes to open/close the door
+                    Timer::after(Duration::from_millis(2000)).await;
+                    door_open.set_low();
+
                     // Flash light/buzzer every 0.25s
                     let mut ticker = Ticker::every(Duration::from_millis(250));
                     let mut ticks = 0;
@@ -130,7 +135,10 @@ async fn io(
                                 ticker.next().await;
                             }
                             // Close door
-                            door_lock.set_low();
+                            door_close.set_high();
+                            // TODO Determine how long it takes to open/close the door
+                            Timer::after(Duration::from_millis(2000)).await;
+                            door_close.set_low();
                             break;
                         }
                     }
@@ -349,6 +357,7 @@ async fn main(spawner: Spawner) {
                         peripherals.GPIO5,
                         peripherals.GPIO6,
                         peripherals.GPIO7,
+                        peripherals.GPIO8,
                         peripherals.UART1,
                         peripherals.GPIO17,
                         peripherals.GPIO18,
