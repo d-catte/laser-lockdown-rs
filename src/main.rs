@@ -331,6 +331,8 @@ async fn main(spawner: Spawner) {
     esp_rtos::start(timg0.timer0);
 
     // Init WiFi Stack
+    // TODO Determine if this is enough heap for Wi-Fi
+    esp_alloc::heap_allocator!(size: 72 * 1024);
     let radio_init = &*laser_lockdown_rs::mk_static!(
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
