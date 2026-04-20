@@ -17,8 +17,8 @@ pub enum Command {
     RemoveAllUsers,
     /// If the user with the specified id is authorized
     IsUser { id: u32 },
-    /// Sets a new hashed password and its salt, overriding the old one
-    SetPassword { hash: [u8; 32], salt: [u8; 16] },
+    /// Sets a new hashed password, overriding the old one
+    SetPassword { hash: [u8; 32]},
     /// Logs when the user opens the door
     LogUser { id: u32 },
 }

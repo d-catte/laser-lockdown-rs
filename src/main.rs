@@ -196,9 +196,8 @@ async fn sd(
     }
 
     // Set password cache
-    if let Ok((hash, salt)) = sd.get_password().await {
+    if let Ok((hash)) = sd.get_password().await {
         let _ = net::PSWD.init(Mutex::new(hash));
-        let _ = net::SALT.init(Mutex::new(salt));
     }
 
     let mut logging_buffer: String<64> = String::new();
@@ -273,8 +272,8 @@ async fn sd(
             Command::IsUser { id } => {
                 user_check.signal(net::valid_user(id).await);
             }
-            Command::SetPassword { hash, salt } => {
-                let result = sd.set_password(hash, salt);
+            Command::SetPassword { hash } => {
+                let result = sd.set_password(hash);
                 if result.is_err() {
                     time_request.signal(());
                     let response = time_response.wait().await;

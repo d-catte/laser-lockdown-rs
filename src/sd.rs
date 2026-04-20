@@ -1,5 +1,5 @@
 use crate::net;
-use crate::net::UserInfo;
+use crate::net::{UserInfo, SALT};
 use crate::sd_utils::DummyTimeSource;
 use core::cell::RefCell;
 use core::fmt::Write;
@@ -228,7 +228,7 @@ impl SD {
     }
 
     /// Sets the hashed password and salt, then stores it in the file
-    pub fn set_password(&self, hash: [u8; 32], salt: [u8; 16]) -> Result<(), ()> {
+    pub fn set_password(&self, hash: [u8; 32]) -> Result<(), ()> {
         self.with_root_dir(|root| {
             // Remove old password file if it exists
             root.delete_file_in_dir(PASSWORD_FILE).ok();
@@ -238,7 +238,6 @@ impl SD {
                 .map_err(|_| ())?;
 
             file.write(&hash).map_err(|_| ())?;
-            file.write(&salt).map_err(|_| ())?;
             file.flush().map_err(|_| ())?;
 
             Ok(())
@@ -246,23 +245,21 @@ impl SD {
     }
 
     /// Gets the hashed password and salt from the file
-    pub async fn get_password(&self) -> Result<([u8; 32], [u8; 16]), ()> {
+    pub async fn get_password(&self) -> Result<[u8; 32], ()> {
         let result = self.with_root_dir(|root| {
             let file = root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly);
 
             let mut hash = [0u8; 32];
-            let mut salt = [0u8; 16];
 
             match file {
                 Ok(file) => {
                     let read_hash = file.read(&mut hash).map_err(|_| ())?;
-                    let read_salt = file.read(&mut salt).map_err(|_| ())?;
 
-                    if read_hash != 32 || read_salt != 16 {
+                    if read_hash != 32 {
                         return Err(());
                     }
 
-                    Ok(Some((hash, salt)))
+                    Ok(Some(hash))
                 }
                 Err(_) => Ok(None),
             }
@@ -273,12 +270,11 @@ impl SD {
         }
 
         // File didn't exist
-        let salt = [1u8; 16];
-        let hash = net::hash_password(DEFAULT_PASSWORD, &salt).await;
+        let hash = net::hash_password(DEFAULT_PASSWORD, &SALT).await;
 
-        self.set_password(hash, salt)?;
+        self.set_password(hash)?;
 
-        Ok((hash, salt))
+        Ok(hash)
     }
 
     /// Adds a new user to the database of authorized users

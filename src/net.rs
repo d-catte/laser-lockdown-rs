@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub static USERS: OnceLock<Mutex<CriticalSectionRawMutex, Vec<UserInfo, 32>>> = OnceLock::new();
 pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<4096>>> = OnceLock::new();
 pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, [u8; 32]>> = OnceLock::new();
-pub static SALT: OnceLock<Mutex<CriticalSectionRawMutex, [u8; 16]>> = OnceLock::new();
+pub const SALT: [u8; 16] = *include_bytes!(env!("SALT_PATH"));
 pub static TOKEN: Mutex<CriticalSectionRawMutex, Option<String<64>>> = Mutex::new(None);
 pub static CMD: OnceLock<&'static Signal<CriticalSectionRawMutex, Command>> = OnceLock::new();
 pub static RAND: OnceLock<Mutex<CriticalSectionRawMutex, Trng>> = OnceLock::new();
@@ -32,7 +32,7 @@ pub static _RNG_SOURCE: OnceLock<TrngSource<'static>> = OnceLock::new();
 static CONFIG: Config = Config::const_default().keep_connection_alive();
 static mut COOKIE_BUF: String<128> = String::new();
 
-/// The port that the webserver will be opened on; Typically this is port 80 for http and 443 for https
+/// The port that the webserver will be opened on; This is port 80 for http
 const WEB_PORT: u16 = 80;
 
 pub async fn web_task<R: PathRouter>(stack: Stack<'static>, router: &Router<R>) -> ! {
@@ -122,8 +122,7 @@ async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
 async fn login(Form(body): Form<LoginRequest>) -> impl IntoResponse {
     // Compute hash
     let computed = {
-        let salt = SALT.get().await.lock().await;
-        hash_password(&body.password, &salt).await
+        hash_password(&body.password, &SALT).await
     };
 
     // Compare with stored hash
@@ -213,17 +212,7 @@ async fn generate_session_token() -> String<64> {
 async fn change_password(
     AuthenticatedLoginRequest { body }: AuthenticatedLoginRequest,
 ) -> impl IntoResponse {
-    let mut new_salt = [0u8; 16];
-    {
-        RAND.get().await.lock().await.read(&mut new_salt);
-    }
-
-    let new_hash = hash_password(body.password.as_str(), &new_salt).await;
-
-    {
-        let mut salt_lock = SALT.get().await.lock().await;
-        *salt_lock = new_salt;
-    }
+    let new_hash = hash_password(body.password.as_str(), &SALT).await;
 
     {
         let mut hash_lock = PSWD.get().await.lock().await;
@@ -232,7 +221,6 @@ async fn change_password(
 
     CMD.get().await.signal(Command::SetPassword {
         hash: new_hash,
-        salt: new_salt,
     });
 
     picoserve::response::Redirect::to("/")

@@ -8,7 +8,6 @@ use esp_radio::wifi::{
 
 use crate::mk_static;
 
-// TODO Maybe find a better way to get these values in?
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 
