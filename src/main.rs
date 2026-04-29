@@ -29,6 +29,7 @@ use esp_hal::{
     spi::Mode as SpiMode,
     spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
 };
+use esp_println::println;
 use esp_rtos::embassy::Executor;
 use heapless::String;
 use laser_lockdown_rs::rfid::SeeedRfid;
@@ -302,13 +303,17 @@ async fn sd(
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     // Setup
-    esp_println::logger::init_logger_from_env();
+    esp_println::logger::init_logger(log::LevelFilter::Info);
+    println!("Initialized logger");
+    println!("Initializing peripherals");
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     // Init PSRAM as heap
+    println!("Initializing PSRAM");
     esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
 
     // Allocate memory for networking packets
+    println!("Allocating heap for networking");
     esp_alloc::heap_allocator!(size: 98767);
 
     // Init HTML
@@ -341,6 +346,7 @@ async fn main(spawner: Spawner) {
     esp_rtos::start(timg0.timer0);
 
     // Init WiFi Stack
+    println!("Initializing WiFi");
     let radio_init = &*laser_lockdown_rs::mk_static!(
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
@@ -352,6 +358,7 @@ async fn main(spawner: Spawner) {
     );
 
     // Init IO
+    println!("Initializing second core");
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
         sw_int.software_interrupt0,
@@ -393,10 +400,12 @@ async fn main(spawner: Spawner) {
     );
 
     // Manage clock
+    println!("Initializing clock");
     spawner
         .spawn(ntp::start_clock(time_request, time_response, stack))
         .ok();
 
     // Init web app on main thread
+    println!("Initializing web server");
     net::start_web_server(*stack, html_ref).await;
 }
