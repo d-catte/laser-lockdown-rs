@@ -17,9 +17,10 @@ use picoserve::request::{ReadAllBodyError, RequestBody, RequestParts};
 use picoserve::response::{
     Connection, ErrorWithStatusCode, IntoResponse, Response, ResponseWriter, StatusCode,
 };
-use picoserve::routing::PathRouter;
+use picoserve::routing::{get_service, PathRouter};
 use picoserve::{Config, ResponseSent, Router};
 use serde::{Deserialize, Serialize};
+use static_cell::StaticCell;
 
 pub static USERS: OnceLock<Mutex<CriticalSectionRawMutex, Vec<UserInfo, 32>>> = OnceLock::new();
 pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<4096>>> = OnceLock::new();
@@ -41,6 +42,7 @@ pub static RAND: OnceLock<Mutex<CriticalSectionRawMutex, Trng>> = OnceLock::new(
 pub static _RNG_SOURCE: OnceLock<TrngSource<'static>> = OnceLock::new();
 static CONFIG: Config = Config::const_default().keep_connection_alive();
 static mut COOKIE_BUF: String<128> = String::new();
+pub static HTML_DATA: StaticCell<&'static str> = StaticCell::new();
 
 /// The port that the webserver will be opened on; This is port 80 for http
 const WEB_PORT: u16 = 80;
@@ -57,11 +59,15 @@ pub async fn web_task<R: PathRouter>(stack: Stack<'static>, router: &Router<R>) 
 }
 
 /// Starts the integrated admin panel
-pub async fn start_web_server(stack: Stack<'static>) {
+pub async fn start_web_server(stack: Stack<'static>, html: &'static str) {
     let router = Router::new()
         .nest("/logs", logs_router())
         .nest("/users", users_router())
-        .nest("/auth", auth_router());
+        .nest("/auth", auth_router())
+        .route(
+            "/",
+            get_service(picoserve::response::File::html(html)),
+        );
 
     web_task(stack, &router).await
 }

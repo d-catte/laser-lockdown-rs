@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
+#![recursion_limit = "256"]
 
+use alloc::boxed::Box;
 use core::cell::RefCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -303,9 +305,17 @@ async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
+    // Init PSRAM as heap
+    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
+
+    // Allocate memory for networking packets
     esp_alloc::heap_allocator!(size: 98767);
 
-    // Intercore communcation
+    // Init HTML
+    let data = Box::leak(alloc::string::String::from(include_str!("index.html")).into_boxed_str());
+    let html_ref = net::HTML_DATA.init(data);
+
+    // Intercore communication
     static COMMANDS: StaticCell<Signal<CriticalSectionRawMutex, Command>> = StaticCell::new();
     let commands = &*COMMANDS.init(Signal::new());
     static USER_CHECK: StaticCell<Signal<CriticalSectionRawMutex, bool>> = StaticCell::new();
@@ -331,8 +341,6 @@ async fn main(spawner: Spawner) {
     esp_rtos::start(timg0.timer0);
 
     // Init WiFi Stack
-    // TODO Determine if this is enough heap for Wi-Fi
-    esp_alloc::heap_allocator!(size: 72 * 1024);
     let radio_init = &*laser_lockdown_rs::mk_static!(
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
@@ -390,5 +398,5 @@ async fn main(spawner: Spawner) {
         .ok();
 
     // Init web app on main thread
-    net::start_web_server(*stack).await;
+    net::start_web_server(*stack, html_ref).await;
 }
