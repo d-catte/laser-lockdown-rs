@@ -197,7 +197,7 @@ async fn sd(
     }
 
     // Set password cache
-    if let Ok((hash)) = sd.get_password().await {
+    if let Ok(hash) = sd.get_password().await {
         let _ = net::PSWD.init(Mutex::new(hash));
     }
 
@@ -222,7 +222,7 @@ async fn sd(
                 *ADD_MODE_ENABLED.lock().await = Instant::now();
             }
             Command::AddUser { id } => {
-                let result = sd.add_user(id);
+                let result = sd.add_user(id).await;
                 if result.is_err() {
                     time_request.signal(());
                     let response = time_response.wait().await;

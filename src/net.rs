@@ -56,22 +56,38 @@ pub async fn web_task<R: PathRouter>(stack: Stack<'static>, router: &Router<R>) 
         .into_never()
 }
 
+/// Starts the integrated admin panel
 pub async fn start_web_server(stack: Stack<'static>) {
     let router = Router::new()
-        .route("/logs", picoserve::routing::get(get_logs))
-        .route("/clear_logs", picoserve::routing::post(clear_logs))
-        .route("/login", picoserve::routing::post(login))
-        .route("/logout", picoserve::routing::post(logout))
-        .route("/users", picoserve::routing::get(get_users))
-        .route("/add_user", picoserve::routing::post(add_user))
-        .route("/remove_user", picoserve::routing::post(remove_user))
-        .route("/update_user", picoserve::routing::post(update_user))
-        .route(
-            "/change_password",
-            picoserve::routing::post(change_password),
-        );
+        .nest("/logs", logs_router())
+        .nest("/users", users_router())
+        .nest("/auth", auth_router());
 
     web_task(stack, &router).await
+}
+
+/// All log endpoints
+fn logs_router<S>() -> Router<impl PathRouter<S>, S> {
+    Router::new()
+        .route("/", picoserve::routing::get(get_logs))
+        .route("/clear", picoserve::routing::post(clear_logs))
+}
+
+/// All user endpoints
+fn users_router<S>() -> Router<impl PathRouter<S>, S> {
+    Router::new()
+        .route("/", picoserve::routing::get(get_users))
+        .route("/add", picoserve::routing::post(add_user))
+        .route("/remove", picoserve::routing::post(remove_user))
+        .route("/update", picoserve::routing::post(update_user))
+}
+
+/// All authentication endpoints
+fn auth_router<S>() -> Router<impl PathRouter<S>, S> {
+    Router::new()
+        .route("/login", picoserve::routing::post(login))
+        .route("/logout", picoserve::routing::post(logout))
+        .route("/change_password", picoserve::routing::post(change_password))
 }
 
 /// Gets the logs
