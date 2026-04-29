@@ -24,7 +24,17 @@ use serde::{Deserialize, Serialize};
 pub static USERS: OnceLock<Mutex<CriticalSectionRawMutex, Vec<UserInfo, 32>>> = OnceLock::new();
 pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<4096>>> = OnceLock::new();
 pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, [u8; 32]>> = OnceLock::new();
-pub const SALT: [u8; 16] = *include_bytes!(env!("SALT_PATH"));
+const SALT_STR: &str = env!("SALT");
+pub const SALT: [u8; 16] = {
+    let bytes = SALT_STR.as_bytes();
+    let mut array = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        array[i] = bytes[i];
+        i += 1;
+    }
+    array
+};
 pub static TOKEN: Mutex<CriticalSectionRawMutex, Option<String<64>>> = Mutex::new(None);
 pub static CMD: OnceLock<&'static Signal<CriticalSectionRawMutex, Command>> = OnceLock::new();
 pub static RAND: OnceLock<Mutex<CriticalSectionRawMutex, Trng>> = OnceLock::new();

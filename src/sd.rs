@@ -279,26 +279,19 @@ impl SD {
 
     /// Adds a new user to the database of authorized users
     pub async fn add_user(&self, id: u32) -> Result<(), ()> {
-        self.with_root_dir(async |root| {
-            let file = root
-                .open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrAppend)
+        let hashed_id = net::hash_id(id).await;
+        let name_bytes = DEFAULT_NEW_USER.as_bytes();
+        self.with_root_dir(|root| {
+            let file = root.open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrAppend)
                 .map_err(|_| ())?;
 
             let mut entry = [0u8; 32 + MAX_NAME_LEN];
-
-            // ID
-            let hashed_id = net::hash_id(id).await;
             entry[..32].copy_from_slice(&hashed_id);
-
-            // Name
-            let name_bytes = DEFAULT_NEW_USER.as_bytes();
             entry[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
 
             file.write(&entry).map_err(|_| ())?;
-            file.flush().map_err(|_| ())?;
-
             Ok(())
-        }).await
+        })
     }
 
     /// Lists all users (up to 32) that are in the database

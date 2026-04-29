@@ -26,8 +26,8 @@ heapless = { version = "0.9.2", features = ["serde"] }
 picoserve = { version = "0.18.0", features = ["embassy", "json"] }
 embedded-sdmmc = "0.9.0"
 serde = { version = "1", default-features = false, features = ["derive"] }
-sntpc = { version = "0.8.1", default-features = false }
-sntpc-net-embassy = { version = "0.8.0", default-features = false }
+sntpc = { version = "0.9.0", default-features = false }
+sntpc-net-embassy = { version = "0.9.0", default-features = false }
 static_cell = "2.1.1"
 nb = "1.1.0"
 serde-json-core = "0.6.0"
