@@ -2,6 +2,7 @@ use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
 use esp_hal::rng::Rng;
+use esp_println::println;
 use esp_radio::wifi::{
     ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
@@ -65,10 +66,11 @@ pub async fn start_wifi(
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         net_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<12>, StackResources::<12>::new()),
         net_seed,
     );
 
+    println!("Creating WiFi Controller");
     spawner.spawn(connection(wifi_controller)).ok();
     spawner.spawn(net_task(runner)).ok();
 
@@ -78,11 +80,13 @@ pub async fn start_wifi(
 }
 
 async fn wait_for_connection(stack: Stack<'_>) {
+    println!("Connecting to {}", SSID);
     loop {
         if stack.is_link_up() {
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
+        println!("Waiting for connection");
     }
 
     loop {
@@ -90,5 +94,6 @@ async fn wait_for_connection(stack: Stack<'_>) {
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
+        println!("Waiting for DHCP");
     }
 }

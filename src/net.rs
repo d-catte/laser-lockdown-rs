@@ -1,7 +1,11 @@
 #![allow(static_mut_refs)]
-use crate::sd_utils;
+
+use alloc::string::ToString;
+use alloc::vec;
+use crate::{sd, sd_utils};
 use crate::signals::Command;
 use core::fmt::{Display, Formatter, Write};
+use core::str::FromStr;
 use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -23,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 
 pub static USERS: OnceLock<Mutex<CriticalSectionRawMutex, Vec<UserInfo, 32>>> = OnceLock::new();
-pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<4096>>> = OnceLock::new();
-pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, [u8; 32]>> = OnceLock::new();
+pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<{ sd::LOG_PACKET_CHAR_COUNT}>>> = OnceLock::new();
+pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, alloc::string::String>> = OnceLock::new();
 const SALT_STR: &str = env!("SALT");
 pub const SALT: [u8; 16] = {
     let bytes = SALT_STR.as_bytes();
@@ -48,9 +52,9 @@ pub static HTML_DATA: StaticCell<&'static str> = StaticCell::new();
 const WEB_PORT: u16 = 80;
 
 pub async fn web_task<R: PathRouter>(stack: Stack<'static>, router: &Router<R>) -> ! {
-    let mut tcp_rx_buffer = [0; 4096];
-    let mut tcp_tx_buffer = [0; 4096];
-    let mut http_buffer = [0; 4096];
+    let mut tcp_rx_buffer = vec![0; 4096].into_boxed_slice();
+    let mut tcp_tx_buffer = vec![0; 4096].into_boxed_slice();
+    let mut http_buffer = vec![0; 4096].into_boxed_slice();
 
     picoserve::Server::new(&router.shared(), &CONFIG, &mut http_buffer)
         .listen_and_serve(0, stack, WEB_PORT, &mut tcp_rx_buffer, &mut tcp_tx_buffer)
@@ -86,6 +90,7 @@ fn users_router<S>() -> Router<impl PathRouter<S>, S> {
         .route("/add", picoserve::routing::post(add_user))
         .route("/remove", picoserve::routing::post(remove_user))
         .route("/update", picoserve::routing::post(update_user))
+        .route("/clear", picoserve::routing::post(remove_all_users))
 }
 
 /// All authentication endpoints
@@ -145,6 +150,14 @@ async fn remove_user(AuthenticatedUserID { body }: AuthenticatedUserID) -> impl 
     picoserve::response::Redirect::to("/")
 }
 
+/// Removes all users in the database
+async fn remove_all_users(_auth: AuthenticatedUser) -> impl IntoResponse {
+    let mut users = USERS.get().await.lock().await;
+    users.clear();
+    CMD.get().await.signal(Command::RemoveAllUsers);
+    picoserve::response::Redirect::to("/")
+}
+
 /// Gets all users in the database
 async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
     let users = USERS.get().await.lock().await.clone();
@@ -153,14 +166,13 @@ async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
 
 async fn login(Form(body): Form<LoginRequest>) -> impl IntoResponse {
     // Compute hash
-    let computed = {
-        hash_password(&body.password).await
-    };
+    let hashed = hash_string(&body.password).await;
 
     // Compare with stored hash
     let valid = {
         let stored = PSWD.get().await.lock().await;
-        *stored == computed
+        let parsed = u64::from_str(&stored).unwrap();
+        parsed == hashed
     };
 
     if !valid {
@@ -204,47 +216,61 @@ async fn logout(_auth: AuthenticatedUser) -> impl IntoResponse {
     )
 }
 
-/// Hashes the password using the hardware SHA256 algorithm
-pub async fn hash_password(password: &str) -> [u8; 32] {
-    let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
-    let mut hasher = sha.start::<Sha256>();
-    let mut data = SALT.as_slice();
-    while !data.is_empty() {
-        data = block!(hasher.update(data)).unwrap();
-    }
-
-    let mut data = password.as_bytes();
-    while !data.is_empty() {
-        data = block!(hasher.update(data)).unwrap();
-    }
-
-    let mut output = [0u8; 32];
-    block!(hasher.finish(&mut output)).unwrap();
-
-    output
-}
-
 /// Hashes the user's id so that it can be stored securely on the SD card
-pub async fn hash_id(value: u32) -> [u8; 32] {
+pub async fn hash_id(value: u64) -> u64 {
     let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
     let mut hasher = sha.start::<Sha256>();
 
+    // Hash the SALT
     let mut salt_data = SALT.as_slice();
     while !salt_data.is_empty() {
         salt_data = block!(hasher.update(salt_data)).unwrap();
     }
 
-    let val_bytes = value.to_be_bytes();
+    // Hash the input value
+    let val_bytes = value.to_le_bytes();
     let mut data = &val_bytes[..];
-
     while !data.is_empty() {
         data = block!(hasher.update(data)).unwrap();
     }
 
-    let mut output = [0u8; 32];
-    block!(hasher.finish(&mut output)).unwrap();
+    // Get the 32-byte raw output
+    let mut full_hash = [0u8; 32];
+    block!(hasher.finish(&mut full_hash)).unwrap();
 
-    output
+    // Convert the first 8 bytes into a u64 (Little Endian)
+    let mut raw_id = [0u8; 8];
+    raw_id.copy_from_slice(&full_hash[..8]);
+
+    u64::from_le_bytes(raw_id)
+}
+
+/// Hashes a String similar to hash_id
+pub async fn hash_string(value: &str) -> u64 {
+    let mut sha = sd_utils::SHA_INSTANCE.get().await.lock().await;
+    let mut hasher = sha.start::<Sha256>();
+
+    // Hash the SALT
+    let mut salt_data = SALT.as_slice();
+    while !salt_data.is_empty() {
+        salt_data = block!(hasher.update(salt_data)).unwrap();
+    }
+
+    // Hash the String data
+    let mut data = value.as_bytes();
+    while !data.is_empty() {
+        data = block!(hasher.update(data)).unwrap();
+    }
+
+    // Finalize and get the 32-byte raw output
+    let mut full_hash = [0u8; 32];
+    block!(hasher.finish(&mut full_hash)).unwrap();
+
+    // Truncate to u64
+    let mut raw_id = [0u8; 8];
+    raw_id.copy_from_slice(&full_hash[..8]);
+
+    u64::from_le_bytes(raw_id)
 }
 
 /// Generates a session token for the user viewing the website.
@@ -267,15 +293,8 @@ async fn generate_session_token() -> String<64> {
 async fn change_password(
     AuthenticatedLoginRequest { body }: AuthenticatedLoginRequest,
 ) -> impl IntoResponse {
-    let new_hash = hash_password(body.password.as_str()).await;
-
-    {
-        let mut hash_lock = PSWD.get().await.lock().await;
-        *hash_lock = new_hash;
-    }
-
     CMD.get().await.signal(Command::SetPassword {
-        hash: new_hash,
+        password: body.password.to_string(),
     });
 
     picoserve::response::Redirect::to("/")
@@ -495,8 +514,8 @@ impl<'r, State> FromRequest<'r, State> for AuthenticatedLoginRequest {
 // Forms
 #[derive(Deserialize, Serialize, Clone)]
 pub struct UserInfo {
-    pub(crate) id: [u8; 32],
-    pub(crate) name: String<32>,
+    pub(crate) id: u64,
+    pub(crate) name: String<35>,
 }
 
 impl<'r, State> FromRequest<'r, State> for UserInfo {
@@ -523,7 +542,7 @@ impl<'r, State> FromRequest<'r, State> for UserInfo {
 
 #[derive(Deserialize, Serialize)]
 pub struct UserID {
-    id: [u8; 32],
+    id: u64,
 }
 
 impl<'r, State> FromRequest<'r, State> for UserID {
@@ -577,7 +596,7 @@ impl<'r, State> FromRequest<'r, State> for LoginRequest {
 
 // API
 /// If the user is contained in the user cache
-pub async fn valid_user(id: [u8; 32]) -> bool {
+pub async fn valid_user(id: u64) -> bool {
     let users = USERS.get().await.lock().await;
     users.iter().any(|u| u.id == id)
 }

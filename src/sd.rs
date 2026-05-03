@@ -1,505 +1,336 @@
 use crate::net;
-use crate::net::UserInfo;
+use crate::net::{hash_string, UserInfo};
 use crate::sd_utils::DummyTimeSource;
+use alloc::format;
+use alloc::string::{String, ToString};
 use core::cell::RefCell;
-use core::fmt::Write;
+use core::str::FromStr;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embedded_hal_bus::spi::RefCellDevice;
-use embedded_sdmmc::{Directory, Mode as FileMode, SdCard, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{Mode, SdCard, VolumeIdx, VolumeManager};
 use esp_hal::delay::Delay;
 use esp_hal::gpio::Output;
-use esp_hal::time::{Instant, Rate};
-use esp_hal::{
-    Blocking,
-    spi::Mode as SpiMode,
-    spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
-};
-use heapless::{String, Vec};
+use esp_hal::spi::master::Spi;
+use esp_hal::Blocking;
+use esp_println::println;
 use static_cell::StaticCell;
 
-/// The implementation of the SD card IO
+pub const LOG_PACKET_CHAR_COUNT: usize = 1024;
+const LOG_MAX_SIZE: u32 = 4096;
+
 pub type SdDevice =
-    SdCard<RefCellDevice<'static, SpiMaster<'static, Blocking>, Output<'static>, Delay>, Delay>;
+SdCard<RefCellDevice<'static, Spi<'static, Blocking>, Output<'static>, Delay>, Delay>;
 
 /// Interface for SD card's SPI
-pub static SPI_BUS: StaticCell<RefCell<SpiMaster<Blocking>>> = StaticCell::new();
+pub static SPI_BUS: StaticCell<RefCell<Spi<Blocking>>> = StaticCell::new();
 
 /// File manager for the SD card
 pub static VOLUME_MGR: StaticCell<RefCell<VolumeManager<SdDevice, DummyTimeSource>>> =
     StaticCell::new();
 
-/// The authorized users database
-const USERS_FILE: &str = "users.dat";
-
-/// The temporary user database created when modifying the existing database
-const TEMP_FILE: &str = "users.tmp";
-
-/// The file where all logs are stored
-const LOG_FILE: &str = "log.txt";
-
-/// The file where the hashed passwords are stored
-const PASSWORD_FILE: &str = "pswd.txt";
-
-/// The maximum size a name can be in UTF-8 characters
-const MAX_NAME_LEN: usize = 32;
-
-/// The max size, in characters, that are sent from the log file to the client
-const LOG_SNAPSHOT_SIZE: usize = 4096;
-
-/// The max size the physical log file can be before being trimmed
-const LOG_MAX_SIZE: usize = LOG_SNAPSHOT_SIZE * 2;
-
-/// The default password when no password is set
-const DEFAULT_PASSWORD: &str = "admin";
-
-/// The name of any newly added user
-const DEFAULT_NEW_USER: &str = "New User";
-
-/// This is the interface for the SD card. The SD card holds all the information for the application
-/// that must persist over power cycles. This includes the following information:
-/// - The hashed admin password for the website
-/// - 32 user entries (8 byte id, 32 character name)
-/// - A log file up to 4096 characters
-pub struct SD {
-    spi_bus: &'static RefCell<SpiMaster<'static, Blocking>>,
-    volume_mgr: &'static RefCell<VolumeManager<SdDevice, DummyTimeSource>>,
+#[derive(Copy, Clone)]
+pub enum FileNameEnum {
+    Log,
+    Users,
+    Password,
+    Temp,
 }
 
-impl SD {
-    /// Create a new SD card instance.
+impl FileNameEnum {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FileNameEnum::Log => "LOG.TXT",
+            FileNameEnum::Users => "USER.TXT",
+            FileNameEnum::Password => "PSWD.TXT",
+            FileNameEnum::Temp => "TMP.TXT",
+        }
+    }
+}
+
+pub struct SdStorage<'a> {
+    _spi_bus: &'a RefCell<Spi<'a, Blocking>>,
+    volume_mgr: &'a VolumeManager<SdCard<RefCellDevice<'a, Spi<'a, Blocking>, Output<'a>, Delay>, Delay>, DummyTimeSource>,
+}
+
+impl<'a> SdStorage<'a> {
+
     pub fn new(
-        volume_mgr: &'static RefCell<VolumeManager<SdDevice, DummyTimeSource>>,
-        spi_bus_ref: &'static RefCell<SpiMaster<Blocking>>,
+        volume_mgr: &'a VolumeManager<SdCard<RefCellDevice<'a, Spi<'a, Blocking>, Output<'a>, Delay>, Delay>, DummyTimeSource>,
+        spi_bus_ref: &'a RefCell<Spi<'a, Blocking>>,
     ) -> Self {
-        SD {
-            spi_bus: spi_bus_ref,
+        Self {
+            _spi_bus: spi_bus_ref,
             volume_mgr,
         }
     }
 
-    /// Initialize the SD card and set the SPI frequency to 2 MHz.
-    pub fn init(&mut self) {
-        // After initializing the SD card, increase the SPI frequency
-        self.spi_bus
-            .borrow_mut()
-            .apply_config(
-                &SpiMasterConfig::default()
-                    .with_frequency(Rate::from_mhz(2))
-                    .with_mode(SpiMode::_0),
-            )
-            .expect("Failed to apply the second SPI configuration");
+    fn write(&mut self, file: FileNameEnum, data: &str, overwrite: bool) {
+        let mode = if overwrite {
+            Mode::ReadWriteCreateOrTruncate
+        } else {
+            Mode::ReadWriteCreateOrAppend
+        };
+
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0))
+            && let Ok(root) = volume.open_root_dir()
+            && let Ok(f) = root.open_file_in_dir(file.as_str(), mode) {
+            let _ = f.write(data.as_bytes());
+        }
     }
 
-    /// Example:
-    /// ```
-    /// sd.with_root_dir(|root| {
-    ///     let mut file = root
-    ///         .open_file_in_dir("log.txt", FileMode::ReadWriteCreateOrAppend)
-    ///         .unwrap();
-    ///
-    ///     file.write(b"Hello\n").unwrap();
-    ///     file.flush().unwrap();
-    /// });
-    /// ```
-    pub fn with_root_dir<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut Directory<SdDevice, DummyTimeSource, 4, 4, 1>) -> R,
-    {
-        let vol_mgr = self.volume_mgr.borrow();
-        let volume = vol_mgr.open_volume(VolumeIdx(0)).unwrap();
+    fn read(&mut self, file: FileNameEnum, line_number: Option<usize>) -> String {
+        let mut output = String::new();
+        let mut buffer = [0u8; 256];
 
-        let mut root = volume.open_root_dir().unwrap();
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0))
+            && let Ok(root) = volume.open_root_dir()
+            && let Ok(f) = root.open_file_in_dir(file.as_str(), Mode::ReadOnly) {
+            let mut current_line = 0;
 
-        f(&mut root)
-    }
+            while !f.is_eof() {
+                let read_count = f.read(&mut buffer).unwrap_or(0);
+                if read_count == 0 { break; }
 
-    /// Appends to the end of the log.
-    /// If the log hits >8192 bytes then the last 4096 bytes are deleted. Realistically this should
-    /// happen fairly infrequently
-    fn append_to_log(&self, message: &str) {
-        let timestamp = Instant::now().duration_since_epoch().as_secs();
+                let contents = core::str::from_utf8(&buffer[..read_count]).unwrap_or("");
 
-        self.with_root_dir(|root| {
-            let mut file = root
-                .open_file_in_dir(LOG_FILE, FileMode::ReadWriteCreateOrAppend)
-                .unwrap();
-
-            let size = file.length() as usize;
-
-            if size >= LOG_MAX_SIZE {
-                let start = size - LOG_SNAPSHOT_SIZE;
-                file.seek_from_start(start as u32).unwrap();
-
-                let mut buf = [0u8; LOG_SNAPSHOT_SIZE];
-                let read = file.read(&mut buf).unwrap();
-
-                let mut slice = &buf[..read];
-
-                // Remove partial first line
-                if let Some(pos) = slice.iter().position(|b| *b == b'\n') {
-                    slice = &slice[pos + 1..];
-                } else {
-                    slice = &[];
-                }
-
-                root.delete_file_in_dir(LOG_FILE).ok();
-
-                let new_file = root
-                    .open_file_in_dir(LOG_FILE, FileMode::ReadWriteCreateOrAppend)
-                    .unwrap();
-
-                new_file.write(slice).unwrap();
-                new_file.flush().unwrap();
-
-                file = new_file;
-            }
-
-            // Append new entry
-            let mut buffer = [0u8; 128];
-            let mut writer = BufferWriter::new(&mut buffer);
-
-            write!(writer, "{} ", timestamp).unwrap();
-            writer.write_str(message).unwrap();
-            writer.write_str("\n").unwrap();
-
-            let len = writer.len();
-
-            file.write(&buffer[..len]).unwrap();
-            file.flush().unwrap();
-        });
-    }
-
-    /// Appends to the log with a timestamp
-    pub fn append(&self, time: String<15>, message: &str, buffer: &mut String<64>) {
-        buffer.clear();
-        writeln!(buffer, "{},{}", time, message).ok();
-        self.append_to_log("Failed to clear log");
-    }
-
-    /// Clears the entire log file
-    pub fn clear_log(&self) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            root.delete_file_in_dir(LOG_FILE).map_err(|_| ())?;
-            Ok(())
-        })
-    }
-
-    /// Gets the latest 4096 characters, disregarding incomplete lines if cut off by the character limit
-    pub fn get_log(&self) -> Result<String<LOG_SNAPSHOT_SIZE>, ()> {
-        self.with_root_dir(|root| {
-            let file = match root.open_file_in_dir(LOG_FILE, FileMode::ReadOnly) {
-                Ok(f) => f,
-                Err(_) => return Ok(String::new()),
-            };
-
-            let file_size = file.length() as usize;
-
-            let start = file_size.saturating_sub(LOG_SNAPSHOT_SIZE);
-
-            if start > 0 {
-                file.seek_from_start(start as u32).map_err(|_| ())?;
-            }
-
-            let mut buffer = [0u8; LOG_SNAPSHOT_SIZE];
-            let read = file.read(&mut buffer).map_err(|_| ())?;
-
-            if read == 0 {
-                return Ok(String::new());
-            }
-
-            let mut slice = &buffer[..read];
-
-            // If we started in the middle of the file, drop the first partial line
-            if start > 0 {
-                if let Some(pos) = slice.iter().position(|b| *b == b'\n') {
-                    slice = &slice[pos + 1..];
-                } else {
-                    // No newline found → all data is partial
-                    return Ok(String::new());
-                }
-            }
-
-            let text = core::str::from_utf8(slice).map_err(|_| ())?;
-
-            let mut log: String<LOG_SNAPSHOT_SIZE> = String::new();
-            log.push_str(text).map_err(|_| ())?;
-
-            Ok(log)
-        })
-    }
-
-    /// Sets the hashed password and salt, then stores it in the file
-    pub fn set_password(&self, hash: [u8; 32]) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            // Remove old password file if it exists
-            root.delete_file_in_dir(PASSWORD_FILE).ok();
-
-            let file = root
-                .open_file_in_dir(PASSWORD_FILE, FileMode::ReadWriteCreateOrAppend)
-                .map_err(|_| ())?;
-
-            file.write(&hash).map_err(|_| ())?;
-            file.flush().map_err(|_| ())?;
-
-            Ok(())
-        })
-    }
-
-    /// Gets the hashed password and salt from the file
-    pub async fn get_password(&self) -> Result<[u8; 32], ()> {
-        let result = self.with_root_dir(|root| {
-            let file = root.open_file_in_dir(PASSWORD_FILE, FileMode::ReadOnly);
-
-            let mut hash = [0u8; 32];
-
-            match file {
-                Ok(file) => {
-                    let read_hash = file.read(&mut hash).map_err(|_| ())?;
-
-                    if read_hash != 32 {
-                        return Err(());
+                if let Some(target) = line_number {
+                    for line in contents.lines() {
+                        if current_line == target {
+                            return String::from(line);
+                        }
+                        current_line += 1;
                     }
-
-                    Ok(Some(hash))
+                } else {
+                    output.push_str(contents);
                 }
-                Err(_) => Ok(None),
             }
-        })?;
-
-        if let Some(v) = result {
-            return Ok(v);
         }
-
-        // File didn't exist
-        let hash = net::hash_password(DEFAULT_PASSWORD).await;
-
-        self.set_password(hash)?;
-
-        Ok(hash)
+        output
     }
 
-    /// Adds a new user to the database of authorized users
-    pub async fn add_user(&self, id: u32) -> Result<(), ()> {
-        let hashed_id = net::hash_id(id).await;
-        let name_bytes = DEFAULT_NEW_USER.as_bytes();
-        self.with_root_dir(|root| {
-            let file = root.open_file_in_dir(USERS_FILE, FileMode::ReadWriteCreateOrAppend)
-                .map_err(|_| ())?;
-
-            let mut entry = [0u8; 32 + MAX_NAME_LEN];
-            entry[..32].copy_from_slice(&hashed_id);
-            entry[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
-
-            file.write(&entry).map_err(|_| ())?;
-            Ok(())
-        })
+    fn remove(&mut self, file: FileNameEnum) {
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0)) && let Ok(root) = volume.open_root_dir() {
+            let _ = root.delete_file_in_dir(file.as_str());
+        }
     }
 
-    /// Lists all users (up to 32) that are in the database
-    pub fn list_users(&self) -> Result<Vec<UserInfo, 32>, ()> {
-        self.with_root_dir(|root| {
-            let mut file = root
-                .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
-                .map_err(|_| ())?;
+    fn truncate(&mut self, file_enum: FileNameEnum, threshold: u32, truncate_to: u32) {
+        // Read the "keep" portion (the end of the file)
+        let keep_content = self.read_from_end(file_enum, truncate_to as usize);
 
-            let mut users: Vec<UserInfo, 32> = Vec::new();
-
-            while let Some(user) = Self::read_entry(&mut file)? {
-                users.push(user).map_err(|_| ())?;
-            }
-
-            Ok(users)
-        })
-    }
-
-    /// Replaces a user's name with the specified id.
-    /// **NOTE**: This is an expensive operation, use infrequently
-    pub fn edit_user_name(&self, id: [u8; 32], new_name: &String<32>) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            let old_file = root
-                .open_file_in_dir(USERS_FILE, FileMode::ReadOnly)
-                .map_err(|_| ())?;
-
-            let new_file = root
-                .open_file_in_dir(TEMP_FILE, FileMode::ReadWriteCreateOrAppend)
-                .map_err(|_| ())?;
-
-            const ENTRY_SIZE: usize = 32 + MAX_NAME_LEN;
-            let mut entry = [0u8; ENTRY_SIZE];
-
-            loop {
-                let read = old_file.read(&mut entry).map_err(|_| ())?;
-
-                if read == 0 {
-                    break;
-                }
-
-                if read != ENTRY_SIZE {
-                    return Err(()); // Corrupted entry
-                }
-
-                if entry[..32] == id {
-
-                    let mut name_buf = [0u8; MAX_NAME_LEN];
-                    let name_bytes = new_name.as_bytes();
-
-                    let copy_len = name_bytes.len().min(MAX_NAME_LEN);
-                    name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
-                    entry[32..].copy_from_slice(&name_buf);
-                }
-
-                new_file.write(&entry).map_err(|_| ())?;
-            }
-
-            new_file.flush().map_err(|_| ())?;
-
-            root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-            self.rename_file(TEMP_FILE, USERS_FILE)?;
-
-            Ok(())
-        })
-    }
-
-    /// Renames a file by copying all of its contents to a new file
-    pub fn rename_file(&self, old_name: &str, new_name: &str) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            let old_file = root
-                .open_file_in_dir(old_name, FileMode::ReadOnly)
-                .map_err(|_| ())?;
-
-            let new_file = root
-                .open_file_in_dir(new_name, FileMode::ReadWriteCreateOrAppend)
-                .map_err(|_| ())?;
-
-            let mut buffer = [0u8; 256];
-
-            loop {
-                let read = old_file.read(&mut buffer).map_err(|_| ())?;
-                if read == 0 {
-                    break;
-                }
-
-                new_file.write(&buffer[..read]).map_err(|_| ())?;
-            }
-
-            new_file.flush().map_err(|_| ())?;
-
-            root.delete_file_in_dir(old_name).map_err(|_| ())?;
-
-            Ok(())
-        })
-    }
-
-    /// Removes a user from the authorized users database
-    pub fn remove_user(&self, id: [u8; 32]) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            let mut original = match root.open_file_in_dir(USERS_FILE, FileMode::ReadOnly) {
-                Ok(f) => f,
-                Err(_) => return Ok(()),
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0))
+            && let Ok(root) = volume.open_root_dir() {
+            // 1. Check file size
+            let file_size = if let Ok(file) = root.open_file_in_dir(file_enum.as_str(), Mode::ReadOnly) {
+                file.length()
+            } else {
+                0
             };
 
-            let temp = root
-                .open_file_in_dir(TEMP_FILE, FileMode::ReadWriteCreateOrTruncate)
-                .map_err(|_| ())?;
+            // 2. If it exceeds threshold, perform the truncation
+            if file_size > threshold {
+                // Re-open in Truncate mode to wipe it and write the kept portion
+                if let Ok(file) = root.open_file_in_dir(file_enum.as_str(), Mode::ReadWriteCreateOrTruncate) {
+                    let _ = file.write(keep_content.as_bytes());
+                    println!("File {} truncated ({} -> {})", file_enum.as_str(), file_size, truncate_to);
+                }
+            }
+        }
+    }
 
-            // Copy all except target ID
-            while let Some(user) = Self::read_entry(&mut original)? {
-                if user.id != id {
-                    temp.write(&user.id).map_err(|_| ())?;
-                    temp.write(user.name.as_bytes()).map_err(|_| ())?;
+    fn read_from_end(&mut self, file_enum: FileNameEnum, num_chars: usize) -> String {
+        let mut output = String::new();
+
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0))
+            && let Ok(root) = volume.open_root_dir()
+            && let Ok(file) = root.open_file_in_dir(file_enum.as_str(), Mode::ReadOnly) {
+            let file_len = file.length() as usize;
+
+            // Determine where to start reading
+            let start_pos = file_len.saturating_sub(num_chars);
+            // Seek to the starting position
+            file.seek_from_start(start_pos as u32).unwrap_or(());
+
+            // Read the remainder of the file
+            let mut buffer = [0u8; 512];
+            while !file.is_eof() {
+                if let Ok(n) = file.read(&mut buffer) {
+                    if n == 0 { break; }
+                    let s = core::str::from_utf8(&buffer[..n]).unwrap_or("");
+                    output.push_str(s);
                 } else {
                     break;
                 }
             }
-
-            temp.flush().map_err(|_| ())?;
-
-            drop(original);
-            drop(temp);
-
-            // Delete original
-            root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-
-            // Rename to original file
-            self.rename_file(TEMP_FILE, USERS_FILE)?;
-
-            Ok(())
-        })
+        }
+        output
     }
 
-    /// Clears the authorized users database
-    pub fn remove_all_users(&self) -> Result<(), ()> {
-        self.with_root_dir(|root| {
-            root.delete_file_in_dir(USERS_FILE).map_err(|_| ())?;
-            Ok(())
-        })
+    // LOGS
+
+    /// Deletes the log file from the SD card
+    pub fn clear_logs(&mut self) {
+        self.remove(FileNameEnum::Log);
     }
 
-    /// Gets the next entry in the authorized users database
-    fn read_entry(
-        file: &mut embedded_sdmmc::File<SdDevice, DummyTimeSource, 4, 4, 1>,
-    ) -> Result<Option<UserInfo>, ()> {
-        // Size: 32 bytes (Hash) + MAX_NAME_LEN
-        const ENTRY_SIZE: usize = 32 + MAX_NAME_LEN;
-        let mut entry = [0u8; ENTRY_SIZE];
+    /// Reads the last 1024 characters of the log file
+    pub fn read_logs(&mut self) -> String {
+        self.read_from_end(FileNameEnum::Log, LOG_PACKET_CHAR_COUNT)
+    }
 
-        let read = file.read(&mut entry).map_err(|_| ())?;
+    /// Logs a message to the logs
+    pub fn log_message(&mut self, message: String, timestamp: Option<heapless::String<15>>) {
+        let log_file = FileNameEnum::Log;
 
-        if read == 0 {
-            return Ok(None);
+        // Check current file size
+        let mut current_size = 0;
+        if let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0))
+            && let Ok(root) = volume.open_root_dir()
+            && let Ok(file) = root.open_file_in_dir(log_file.as_str(), Mode::ReadOnly) {
+            current_size = file.length();
         }
 
-        if read < ENTRY_SIZE {
-            return Err(()); // Corrupted file or EOF reached early
+        // If size >= threshold, truncate the file
+        if current_size >= LOG_MAX_SIZE {
+            self.truncate(log_file, LOG_MAX_SIZE, LOG_PACKET_CHAR_COUNT as u32);
+            println!("Log threshold reached. Truncated to {} bytes.", LOG_PACKET_CHAR_COUNT);
         }
 
-        // Extract the Hashed ID (the first 32 bytes)
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&entry[0..32]);
-
-        // Extract name bytes (starting at index 32)
-        let name_bytes = &entry[32..32 + MAX_NAME_LEN];
-
-        // Find real length (remove zero padding)
-        let len = name_bytes
-            .iter()
-            .position(|b| *b == 0)
-            .unwrap_or(MAX_NAME_LEN);
-
-        let mut name: String<32> = String::new();
-        let name_str = core::str::from_utf8(&name_bytes[..len]).map_err(|_| ())?;
-        name.push_str(name_str).map_err(|_| ())?;
-
-        Ok(Some(UserInfo { id, name }))
-    }
-}
-
-struct BufferWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl<'a> BufferWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, pos: 0 }
+        // Append the new message
+        let formatted_message = if let Some(timestamp) = timestamp {
+            format!("{} {}\n",timestamp, message)
+        } else {
+            format!("{}\n", message)
+        };
+        self.write(log_file, &formatted_message, false);
     }
 
-    fn len(&self) -> usize {
-        self.pos
+    /// Gets the current time as a timestamp
+    pub async fn get_timestamp(
+        &self,
+        time_request: &'static Signal<CriticalSectionRawMutex, ()>,
+        time_response: &'static Signal<CriticalSectionRawMutex, Option<heapless::String<15>>>,
+    ) -> heapless::String<15> {
+        time_request.signal(());
+        let response = time_response.wait().await;
+        if let Some(date) = response {
+            date
+        } else {
+            heapless::String::new()
+        }
     }
-}
 
-impl<'a> Write for BufferWriter<'a> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let end = self.pos + bytes.len();
+    // Users
+    /// Adds a user to the database
+    pub async fn add_user(&mut self, id: u64, name: Option<String>) {
+        let hashed_id = net::hash_id(id).await;
+        // Line: "id:name\n"
+        let entry = if let Some(name) = name {
+            format!("{}:{}\n", hashed_id, name)
+        } else {
+           format!("{}:NULL\n", hashed_id)
+        };
 
-        if end > self.buf.len() {
-            return Err(core::fmt::Error);
+        self.write(FileNameEnum::Users, &entry, false);
+    }
+
+    /// Checks whether a user is located in the database
+    pub async fn user_present(&mut self, id: u64) -> bool {
+        let hashed_id = net::hash_id(id).await;
+        let id_str = hashed_id.to_string();
+        let content = self.read(FileNameEnum::Users, None);
+
+        for line in content.lines() {
+            if let Some((line_id, _)) = line.split_once(':')
+                && line_id == id_str {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes the specified user
+    pub async fn remove_user(&mut self, id: u64) {
+        let hashed_id = net::hash_id(id).await;
+        let id_str = hashed_id.to_string();
+        let content = self.read(FileNameEnum::Users, None);
+        let mut new_content = String::with_capacity(content.len());
+
+        for line in content.lines() {
+            if let Some((line_id, _)) = line.split_once(':')
+                && line_id != id_str {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
         }
 
-        self.buf[self.pos..end].copy_from_slice(bytes);
-        self.pos = end;
-        Ok(())
+        // Overwrite the file with the filtered content
+        self.write(FileNameEnum::Users, &new_content, true);
+    }
+
+    /// Modifies the name of an existing user
+    pub async fn change_name(&mut self, id: u64, new_name: String) {
+        let hashed_id = net::hash_id(id).await;
+        let id_str = hashed_id.to_string();
+        let content = self.read(FileNameEnum::Users, None);
+        let mut new_content = String::with_capacity(content.len());
+        let mut found = false;
+
+        for line in content.lines() {
+            if let Some((line_id, _)) = line.split_once(':') {
+                if line_id == id_str {
+                    new_content.push_str(&format!("{}:{}\n", id, new_name));
+                    found = true;
+                } else {
+                    new_content.push_str(line);
+                    new_content.push('\n');
+                }
+            }
+        }
+
+        if found {
+            self.write(FileNameEnum::Users, &new_content, true);
+        }
+    }
+
+    /// Lists all users inside the database
+    pub fn list_users(&mut self) -> heapless::vec::Vec<UserInfo, 32> {
+        let mut users = heapless::vec::Vec::new();
+
+        let content = self.read(FileNameEnum::Users, None);
+
+        for line in content.lines() {
+            // Lines are formatted as "id:name"
+            if let Some((id_str, name)) = line.split_once(':')
+                && let Ok(id) = id_str.parse::<u64>() {
+                let user = UserInfo {
+                    id,
+                    name: heapless::String::from_str(name).unwrap(),
+                };
+                let _ = users.push(user);
+            }
+        }
+
+        users
+    }
+
+    /// Removes all users from the database
+    pub fn remove_all_users(&mut self) {
+        self.remove(FileNameEnum::Users);
+    }
+
+    // Password
+
+    /// Writes a new password
+    pub async fn set_password(&mut self, password: String) {
+        let hash = hash_string(&password).await;
+        let parsed_password = hash.to_string();
+        self.write(FileNameEnum::Password, &parsed_password, true);
+    }
+
+    /// Gets the hashed password
+    pub fn get_password(&mut self) -> String {
+        self.read(FileNameEnum::Password, None)
     }
 }

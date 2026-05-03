@@ -23,8 +23,11 @@ const UTC_OFFSET: i8 = -5;
 /// It is synced on demand after 24 hours.
 pub struct Clock<'a> {
     stack: &'a Stack<'a>,
-    socket: UdpSocketWrapper<'a>,
     context: NtpContext<Timestamp>,
+    rx_meta: &'a mut [PacketMetadata],
+    rx_buf: &'a mut [u8],
+    tx_meta: &'a mut [PacketMetadata],
+    tx_buf: &'a mut [u8],
 
     base_unix: u64,
     synced_at: Instant,
@@ -55,13 +58,12 @@ impl<'a> Clock<'a> {
         tx_meta: &'a mut [PacketMetadata],
         tx_buf: &'a mut [u8],
     ) -> Self {
-        let mut socket: UdpSocket = UdpSocket::new(*stack, rx_meta, rx_buf, tx_meta, tx_buf);
-
-        socket.bind(0).unwrap();
-
         Self {
             stack,
-            socket: UdpSocketWrapper::new(socket),
+            rx_meta,
+            rx_buf,
+            tx_meta,
+            tx_buf,
             context: NtpContext::new(Timestamp::default()),
             base_unix: 0,
             synced_at: Instant::now(),
@@ -70,28 +72,28 @@ impl<'a> Clock<'a> {
 
     /// Sync with NTP server
     pub async fn sync(&mut self) -> Result<(), ()> {
-        let addrs = self
-            .stack
-            .dns_query(NTP_SERVER, DnsQueryType::A)
-            .await
-            .map_err(|_| ())?;
+        let mut socket = UdpSocket::new(
+            *self.stack,
+            self.rx_meta,
+            self.rx_buf,
+            self.tx_meta,
+            self.tx_buf
+        );
+        socket.bind(0).unwrap();
+        let socket_wrapper = UdpSocketWrapper::new(socket);
 
-        if addrs.is_empty() {
-            return Err(());
-        }
+        let addrs = self.stack.dns_query(NTP_SERVER, DnsQueryType::A).await.map_err(|_| ())?;
+        if addrs.is_empty() { return Err(()); }
 
         let addr: IpAddr = addrs[0].into();
         let socket_addr = SocketAddr::from((addr, 123));
 
-        let result = get_time(socket_addr, &self.socket, self.context)
+        let result = get_time(socket_addr, &socket_wrapper, self.context)
             .await
             .map_err(|_| ())?;
 
-        let unix = result.sec();
-
-        self.base_unix = unix as u64;
+        self.base_unix = result.sec() as u64;
         self.synced_at = Instant::now();
-
         Ok(())
     }
 

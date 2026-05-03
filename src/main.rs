@@ -1,56 +1,72 @@
 #![no_std]
 #![no_main]
 #![recursion_limit = "256"]
+#![allow(static_mut_refs)]
+#![feature(type_alias_impl_trait)]
 
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::ToString;
 use core::cell::RefCell;
-use core::fmt::Write;
+use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::RefCellDevice;
-use embedded_sdmmc::{SdCard, VolumeManager};
+use embedded_sdmmc::{SdCard, VolumeIdx, VolumeManager};
 use esp_backtrace as _;
-use esp_hal::peripherals::{GPIO4, GPIO5, GPIO6, GPIO7, GPIO10, GPIO11, GPIO12, GPIO13, GPIO17, GPIO18, SPI2, UART1, GPIO8};
+use esp_hal::peripherals::{GPIO10, GPIO11, GPIO12, GPIO13, SPI2};
 use esp_hal::rng::{Rng, Trng, TrngSource};
 use esp_hal::sha::Sha;
 use esp_hal::time::Rate;
 use esp_hal::{
-    Blocking,
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
     interrupt::software::SoftwareInterruptControl,
     system::Stack,
     timer::timg::TimerGroup,
-    uart::{Config, Uart},
 };
 use esp_hal::{
-    delay::Delay as EspHalDelay,
     spi::Mode as SpiMode,
     spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
 };
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{AnyPin, Pin};
 use esp_println::println;
 use esp_rtos::embassy::Executor;
 use heapless::String;
-use laser_lockdown_rs::rfid::SeeedRfid;
-use laser_lockdown_rs::sd_utils::DummyTimeSource;
 use laser_lockdown_rs::signals::Command;
-use laser_lockdown_rs::{net, ntp, sd, sd_utils};
-use sd::SD;
-use sd::SPI_BUS;
+use laser_lockdown_rs::{net, ntp, sd_utils};
 use static_cell::StaticCell;
+use laser_lockdown_rs::rfid::HIDReader;
+use laser_lockdown_rs::sd::{SdStorage};
+use laser_lockdown_rs::sd_utils::{retry_with_backoff, DummyTimeSource};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const CARD_READER_DELAY: Duration = Duration::from_secs(5);
 
 static ADD_MODE: AtomicBool = AtomicBool::new(false);
 static ADD_MODE_ENABLED: Mutex<CriticalSectionRawMutex, Instant> = Mutex::new(Instant::MIN);
 const MAX_ADD_MODE_TIME: Duration = Duration::from_secs(20);
+const WIFI_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("\n--- PANIC ---");
+
+    if let Some(location) = info.location() {
+        println!(
+            "Location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    }
+    println!("{}", info.message());
+
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 extern crate alloc;
@@ -58,102 +74,127 @@ extern crate alloc;
 /// Handles the GPIO and other IO
 #[embassy_executor::task]
 async fn io(
-    gpio4: GPIO4<'static>,
-    gpio5: GPIO5<'static>,
-    gpio6: GPIO6<'static>,
-    gpio7: GPIO7<'static>,
-    gpio8: GPIO8<'static>,
-    uart1: UART1<'static>,
-    gpio17: GPIO17<'static>,
-    gpio18: GPIO18<'static>,
+    gpio4: AnyPin<'static>,
+    gpio5: AnyPin<'static>,
+    gpio6: AnyPin<'static>,
+    gpio7: AnyPin<'static>,
+    gpio8: AnyPin<'static>,
+    gpio17: AnyPin<'static>,
+    gpio18: AnyPin<'static>,
     cmd: &'static Signal<CriticalSectionRawMutex, Command>,
     user_check: &'static Signal<CriticalSectionRawMutex, bool>,
 ) {
     // Set up GPIO and IO
+    println!("Initializing IO");
+
+    // Indicator LED
+    println!("Testing LED");
     let mut indicator_led = Output::new(gpio4, Level::Low, OutputConfig::default());
+    indicator_led.set_high();
+    Timer::after(Duration::from_secs(5)).await;
+    indicator_led.set_low();
+    println!("Initialized LED");
+
+    // Buzzer
+    println!("Testing Buzzer");
     let mut buzzer = Output::new(gpio5, Level::Low, OutputConfig::default());
+    buzzer.set_high();
+    Timer::after(Duration::from_secs(5)).await;
+    buzzer.set_low();
+    println!("Initialized Buzzer");
+
+    // Door switch
     let door_sensor = Input::new(gpio6, InputConfig::default());
+    println!("Initialized Door Sensor");
+
+    // Actuator
+    println!("Testing Actuator");
     let mut door_open = Output::new(gpio7, Level::Low, OutputConfig::default());
     let mut door_close = Output::new(gpio8, Level::Low, OutputConfig::default());
-    let uart1 = Uart::new(uart1, Config::default())
-        .unwrap()
-        .with_rx(gpio18)
-        .with_tx(gpio17);
-    let mut keycard_reader = SeeedRfid::new(uart1, CARD_READER_DELAY);
+    println!("Initialized Actuator");
+
+    // Card Reader
+    println!("Initializing Card Reader");
+    let d0 = Input::new(gpio17, InputConfig::default());
+    let d1 = Input::new(gpio18, InputConfig::default());
+
+    let mut reader = HIDReader::new(d0, d1);
+    println!("Initialized Card Reader");
     loop {
-        if let Some(card_id) = keycard_reader.read().await {
-            // Check if add mode is enabled
-            if ADD_MODE.load(Ordering::Relaxed) {
-                ADD_MODE.store(false, Ordering::Relaxed);
+        println!("Waiting for card");
+        let code = reader.read_card().await;
+        let card_id = code & 0xFFFF;
+        // Check if add mode is enabled
+        if ADD_MODE.load(Ordering::Relaxed) {
+            ADD_MODE.store(false, Ordering::Relaxed);
 
-                // Check if the add mode hasn't expired
-                if Instant::now().duration_since(*ADD_MODE_ENABLED.lock().await) < MAX_ADD_MODE_TIME
-                {
-                    cmd.signal(Command::AddUser { id: card_id });
+            // Check if the add mode hasn't expired
+            if Instant::now().duration_since(*ADD_MODE_ENABLED.lock().await) < MAX_ADD_MODE_TIME
+            {
+                cmd.signal(Command::AddUser { id: card_id });
 
-                    for _ in 0..3 {
-                        indicator_led.set_high();
-                        buzzer.set_high();
-                        Timer::after(Duration::from_millis(500)).await;
-
-                        indicator_led.set_low();
-                        buzzer.set_low();
-                        Timer::after(Duration::from_millis(500)).await;
-                    }
-                    continue;
-                }
-            }
-
-            // Door closed
-            if door_sensor.is_high() {
-                let hashed_id = net::hash_id(card_id).await;
-                cmd.signal(Command::IsUser { id: hashed_id });
-                let user_exists = user_check.wait().await;
-                if user_exists {
-                    cmd.signal(Command::LogUser { id: hashed_id });
-
-                    door_open.set_high();
-                    // TODO Determine how long it takes to open/close the door
-                    Timer::after(Duration::from_millis(2000)).await;
-                    door_open.set_low();
-
-                    // Flash light/buzzer every 0.25s
-                    let mut ticker = Ticker::every(Duration::from_millis(250));
-                    let mut ticks = 0;
-                    loop {
-                        if door_sensor.is_high() {
-                            indicator_led.set_high();
-                            buzzer.set_high();
-                            ticker.next().await;
-                            indicator_led.set_low();
-                            buzzer.set_low();
-                            ticker.next().await;
-                        }
-                        ticks += 1;
-                        // Relock door after 10s
-                        if ticks == 20 {
-                            // Stop ticker
-                            let mut ticker = Ticker::every(Duration::from_millis(250));
-                            // Wait for door to close
-                            while door_sensor.is_low() {
-                                ticker.next().await;
-                            }
-                            // Close door
-                            door_close.set_high();
-                            // TODO Determine how long it takes to open/close the door
-                            Timer::after(Duration::from_millis(2000)).await;
-                            door_close.set_low();
-                            break;
-                        }
-                    }
-                } else {
-                    let timer = Timer::after(Duration::from_secs(1));
+                for _ in 0..3 {
                     indicator_led.set_high();
                     buzzer.set_high();
-                    timer.await;
+                    Timer::after(Duration::from_millis(500)).await;
+
                     indicator_led.set_low();
                     buzzer.set_low();
+                    Timer::after(Duration::from_millis(500)).await;
                 }
+                continue;
+            }
+        }
+
+        // Door closed
+        if door_sensor.is_high() {
+            let hashed_id = net::hash_id(card_id).await;
+            cmd.signal(Command::IsUser { id: hashed_id });
+            let user_exists = user_check.wait().await;
+            if user_exists {
+                cmd.signal(Command::LogUser { id: hashed_id });
+
+                door_open.set_high();
+                // TODO Determine how long it takes to open/close the door
+                Timer::after(Duration::from_millis(2000)).await;
+                door_open.set_low();
+
+                // Flash light/buzzer every 0.25s
+                let mut ticker = Ticker::every(Duration::from_millis(250));
+                let mut ticks = 0;
+                loop {
+                    if door_sensor.is_high() {
+                        indicator_led.set_high();
+                        buzzer.set_high();
+                        ticker.next().await;
+                        indicator_led.set_low();
+                        buzzer.set_low();
+                        ticker.next().await;
+                    }
+                    ticks += 1;
+                    // Relock door after 10s
+                    if ticks == 20 {
+                        // Stop ticker
+                        let mut ticker = Ticker::every(Duration::from_millis(250));
+                        // Wait for door to close
+                        while door_sensor.is_low() {
+                            ticker.next().await;
+                        }
+                        // Close door
+                        door_close.set_high();
+                        // TODO Determine how long it takes to open/close the door
+                        Timer::after(Duration::from_millis(2000)).await;
+                        door_close.set_low();
+                        break;
+                    }
+                }
+            } else {
+                let timer = Timer::after(Duration::from_secs(1));
+                indicator_led.set_high();
+                buzzer.set_high();
+                timer.await;
+                indicator_led.set_low();
+                buzzer.set_low();
             }
         }
     }
@@ -172,129 +213,141 @@ async fn sd(
     time_request: &'static Signal<CriticalSectionRawMutex, ()>,
     time_response: &'static Signal<CriticalSectionRawMutex, Option<String<15>>>,
 ) {
+    // Setup SD
+    // Start with low frequency for initialization
     let cs = Output::new(gpio10, Level::High, OutputConfig::default());
+
+    // Start with low frequency for initialization
     let spi_bus_config = SpiMasterConfig::default()
-        .with_frequency(Rate::from_khz(400))
+        .with_frequency(Rate::from_khz(400)) // 400kHz for initialization
         .with_mode(SpiMode::_0);
+
     let spi_bus = SpiMaster::new(spi2, spi_bus_config)
-        .unwrap()
+        .expect("Failed to initialize SPI bus")
         .with_miso(miso)
         .with_mosi(mosi)
         .with_sck(sclk);
-    let spi_bus_ref: &'static RefCell<SpiMaster<Blocking>> = SPI_BUS.init(RefCell::new(spi_bus));
-    let spi_device = RefCellDevice::new(spi_bus_ref, cs, EspHalDelay::new()).unwrap();
-    let sdcard = SdCard::new(spi_device, EspHalDelay::new());
+
+    let shared_spi_bus = RefCell::new(spi_bus);
+    let spi_device = RefCellDevice::new(&shared_spi_bus, cs, Delay::new())
+        .expect("Failed to create SPI device");
+
+    println!("    SPI bus configured");
+
+    // Initialize SD card with retry logic
+    let sdcard = SdCard::new(spi_device, Delay::new());
+    println!("Initializing SD Card...");
+    let sd_size =
+        retry_with_backoff("SD Card initialization", || async { sdcard.num_bytes() }).await;
+    if let Some(num_bytes) = sd_size {
+        println!(
+            "    SD Card ready - size: {} GB",
+            num_bytes / 1024 / 1024 / 1024
+        );
+    } else {
+        println!("    SD Card initialization failed");
+    }
+
+    // Open volume 0 (main partition)
     let volume_mgr = VolumeManager::new(sdcard, DummyTimeSource);
-    let vol_mgr: &'static RefCell<VolumeManager<sd::SdDevice, DummyTimeSource>> =
-        sd::VOLUME_MGR.init(RefCell::new(volume_mgr));
-    let sd = SD::new(vol_mgr, spi_bus_ref);
+    let volume0 = if sd_size.is_some() {
+        retry_with_backoff("Opening volume 0", || async {
+            volume_mgr.open_volume(VolumeIdx(0))
+        })
+            .await
+    } else {
+        None
+    };
+    if volume0.is_some() {
+        println!("    Volume 0 opened");
+    }
+
+    // Open root directory
+    let root_dir = if let Some(ref volume) = volume0 {
+        retry_with_backoff("Opening root directory", || async {
+            volume.open_root_dir()
+        })
+            .await
+    } else {
+        None
+    };
+    if root_dir.is_some() {
+        println!("    Root directory opened");
+    }
+
+    // After initializing the SD card, increase the SPI frequency
+    shared_spi_bus
+        .borrow_mut()
+        .apply_config(
+            &SpiMasterConfig::default()
+                .with_frequency(Rate::from_mhz(2))
+                .with_mode(SpiMode::_0),
+        )
+        .expect("Failed to apply the second SPI configuration");
+
+    let mut sd_device = SdStorage::new(
+        &volume_mgr,
+        &shared_spi_bus
+    );
 
     // Set user cache
-    if let Ok(users) = sd.list_users() {
-        let _ = net::USERS.init(Mutex::new(users));
-    }
+    println!("Generating User Cache");
+    let users = sd_device.list_users();
+    let _ = net::USERS.init(Mutex::new(users));
 
     // Set log cache
-    if let Ok(log) = sd.get_log() {
-        let _ = net::LOGS.init(Mutex::new(log));
-    }
+    println!("Generating Log Cache");
+    let logs = sd_device.read_logs();
+    let confined: String<1024> = String::from_str(&logs).unwrap();
+    let _ = net::LOGS.init(Mutex::new(confined));
 
     // Set password cache
-    if let Ok(hash) = sd.get_password().await {
-        let _ = net::PSWD.init(Mutex::new(hash));
-    }
-
-    let mut logging_buffer: String<64> = String::new();
-    let mut msg_buffer: String<49> = String::new();
+    println!("Generating Password Cache");
+    let _ = net::PSWD.init(Mutex::new(sd_device.get_password()));
 
     loop {
         let cmd = cmd.wait().await;
+        println!("Received SD Command");
         match cmd {
             Command::ClearLog => {
-                let result = sd.clear_log();
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        sd.append(date, "Failed to clear log.", &mut logging_buffer);
-                    }
-                }
+                sd_device.clear_logs();
             }
             Command::AddUserMode => {
+                println!("Add User Mode");
                 ADD_MODE.store(true, Ordering::Relaxed);
                 *ADD_MODE_ENABLED.lock().await = Instant::now();
             }
             Command::AddUser { id } => {
-                let result = sd.add_user(id).await;
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        msg_buffer.clear();
-                        msg_buffer.push_str("Failed to add ").unwrap();
-                        write!(msg_buffer, "{}", id).unwrap();
-                        sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
-                    }
-                }
+                println!("Adding user {:?}", id);
+                sd_device.add_user(id, None).await;
             }
             Command::RemoveUser { id } => {
-                let result = sd.remove_user(id);
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        msg_buffer.clear();
-                        msg_buffer.push_str("Failed to remove ").unwrap();
-                        write!(msg_buffer, "{:?}", id).unwrap();
-                        sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
-                    }
-                }
+                println!("Removing user {:?}", id);
+                sd_device.remove_user(id).await;
             }
             Command::UpdateUser { id, name } => {
-                let result = sd.edit_user_name(id, &name);
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        msg_buffer.clear();
-                        msg_buffer.push_str("Failed to edit ").unwrap();
-                        write!(msg_buffer, "{:?}", id).unwrap();
-                        sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
-                    }
-                }
+                println!("Updating user {:?} as {}", id, name);
+                sd_device.change_name(id, name.to_string()).await;
             }
             Command::RemoveAllUsers => {
-                let result = sd.remove_all_users();
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        sd.append(date, "Failed to remove users.", &mut logging_buffer);
-                    }
-                }
+                println!("Remove All Users");
+               sd_device.remove_all_users();
             }
             Command::IsUser { id } => {
+                println!("Is User {:?}", id);
                 user_check.signal(net::valid_user(id).await);
             }
-            Command::SetPassword { hash } => {
-                let result = sd.set_password(hash);
-                if result.is_err() {
-                    time_request.signal(());
-                    let response = time_response.wait().await;
-                    if let Some(date) = response {
-                        sd.append(date, "Failed to set password.", &mut logging_buffer);
-                    }
-                }
+            Command::SetPassword { password } => {
+                println!("Setting Password");
+               sd_device.set_password(password).await;
             }
             Command::LogUser { id } => {
-                time_request.signal(());
-                let response = time_response.wait().await;
-                if let Some(date) = response {
-                    msg_buffer.clear();
-                    msg_buffer.push_str("Accessed: ").unwrap();
-                    write!(msg_buffer, "{:?}", id).unwrap();
-                    sd.append(date, msg_buffer.as_str(), &mut logging_buffer);
-                }
+                let timestamp = sd_device.get_timestamp(
+                    time_request,
+                    time_response,
+                ).await;
+                let msg = format!("Accessed: {}", id);
+                sd_device.log_message(msg, Some(timestamp));
             }
         }
     }
@@ -303,18 +356,26 @@ async fn sd(
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     // Setup
-    esp_println::logger::init_logger(log::LevelFilter::Info);
-    println!("Initialized logger");
-    println!("Initializing peripherals");
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     // Init PSRAM as heap
-    println!("Initializing PSRAM");
     esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
 
-    // Allocate memory for networking packets
-    println!("Allocating heap for networking");
-    esp_alloc::heap_allocator!(size: 98767);
+    // TODO Possibly revert this to safe code
+    unsafe {
+        #[unsafe(link_section = ".data")]
+        static mut WIFI_HEAP: [u8; 80_000] = [0u8; 80_000];
+
+        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+            WIFI_HEAP.as_mut_ptr(),
+            WIFI_HEAP.len(),
+            esp_alloc::MemoryCapability::Internal.into(),
+        ));
+    }
+
+
+    esp_println::logger::init_logger(log::LevelFilter::Info);
+    println!("Initialized logger");
 
     // Init HTML
     let data = Box::leak(alloc::string::String::from(include_str!("index.html")).into_boxed_str());
@@ -351,61 +412,93 @@ async fn main(spawner: Spawner) {
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
+    println!("Initializing RNG");
     let rng = Rng::new();
-    static STACK_CELL: StaticCell<embassy_net::Stack<'static>> = StaticCell::new();
-    let stack: &'static mut embassy_net::Stack<'static> = STACK_CELL.init(
-        laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner).await,
-    );
+    static STACK_CELL: StaticCell<Option<embassy_net::Stack<'static>>> = StaticCell::new();
 
+    println!("Starting WiFi");
+    let wifi_result = with_timeout(
+        WIFI_TIMEOUT,
+        laser_lockdown_rs::wifi::start_wifi(radio_init, peripherals.WIFI, rng, &spawner)
+    ).await;
+
+    let stack: &'static mut Option<embassy_net::Stack<'static>> = match wifi_result {
+        Ok(s) => {
+            println!("WiFi connected successfully!");
+            STACK_CELL.init(Some(s))
+        }
+        Err(_) => {
+            println!("WiFi connection timed out! Proceeding in offline mode...");
+            STACK_CELL.init(None)
+        }
+    };
     // Init IO
     println!("Initializing second core");
+    let io_pins = (
+        peripherals.GPIO4,
+        peripherals.GPIO5,
+        peripherals.GPIO6,
+        peripherals.GPIO7,
+        peripherals.GPIO8,
+        peripherals.GPIO17,
+        peripherals.GPIO18,
+    );
+
+    let sd_pins = (
+        peripherals.GPIO10,
+        peripherals.GPIO11,
+        peripherals.GPIO12,
+        peripherals.GPIO13,
+        peripherals.SPI2,
+    );
+
+    let cpu_ctrl = peripherals.CPU_CTRL;
+
     esp_rtos::start_second_core(
-        peripherals.CPU_CTRL,
+        cpu_ctrl,
         sw_int.software_interrupt0,
         sw_int.software_interrupt1,
         app_core_stack,
         move || {
             static EXECUTOR: StaticCell<Executor> = StaticCell::new();
             let executor = EXECUTOR.init(Executor::new());
+
             executor.run(|spawner| {
-                spawner
-                    .spawn(io(
-                        peripherals.GPIO4,
-                        peripherals.GPIO5,
-                        peripherals.GPIO6,
-                        peripherals.GPIO7,
-                        peripherals.GPIO8,
-                        peripherals.UART1,
-                        peripherals.GPIO17,
-                        peripherals.GPIO18,
-                        commands,
-                        user_check,
-                    ))
-                    .ok();
-                spawner
-                    .spawn(sd(
-                        peripherals.GPIO10,
-                        peripherals.GPIO11,
-                        peripherals.GPIO12,
-                        peripherals.GPIO13,
-                        peripherals.SPI2,
-                        commands,
-                        user_check,
-                        time_request,
-                        time_response,
-                    ))
-                    .ok();
+                spawner.spawn(io(
+                    io_pins.0.degrade(),
+                    io_pins.1.degrade(),
+                    io_pins.2.degrade(),
+                    io_pins.3.degrade(),
+                    io_pins.4.degrade(),
+                    io_pins.5.degrade(),
+                    io_pins.6.degrade(),
+                    commands,
+                    user_check,
+                )).ok();
+                spawner.spawn(sd(
+                    sd_pins.0,
+                    sd_pins.1,
+                    sd_pins.2,
+                    sd_pins.3,
+                    sd_pins.4,
+                    commands,
+                    user_check,
+                    time_request,
+                    time_response,
+                )).ok();
             });
         },
     );
 
     // Manage clock
-    println!("Initializing clock");
-    spawner
-        .spawn(ntp::start_clock(time_request, time_response, stack))
-        .ok();
+    if let Some(stack) = stack {
+        println!("Initializing clock");
+        spawner
+            .spawn(ntp::start_clock(time_request, time_response, stack))
+            .ok();
 
-    // Init web app on main thread
-    println!("Initializing web server");
-    net::start_web_server(*stack, html_ref).await;
+        // Init web app on main thread
+        println!("Initializing web server");
+        net::start_web_server(*stack, html_ref).await;
+    }
 }

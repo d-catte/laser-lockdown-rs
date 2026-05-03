@@ -168,7 +168,7 @@
         errorDiv.innerText = ""; // clear previous error
 
         try {
-            const res = await fetch("/login", {
+            const res = await fetch("/auth/login", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({ password })
@@ -196,7 +196,7 @@
     }
 
     async function logout() {
-        await fetch("/logout", { method: "POST" });
+        await fetch("/auth/logout", { method: "POST" });
         location.reload();
     }
 
@@ -207,7 +207,7 @@
     }
 
     async function loadLogs() {
-        const res = await fetch("/logs");
+        const res = await fetch("/logs/");
 
         if (!res.ok) {
             location.reload();
@@ -231,7 +231,7 @@
     /* ================= USERS ================= */
 
     async function loadUsers() {
-        const res = await fetch("/users");
+        const res = await fetch("/users/");
         if (!res.ok) {
             location.reload();
             return;
@@ -265,7 +265,7 @@
     }
 
     async function removeUser(id) {
-        await fetch("/remove_user", {
+        await fetch("/users/remove", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({ id })
@@ -274,7 +274,7 @@
     }
 
     async function updateUser(id, name) {
-        await fetch("/update_user", {
+        await fetch("/users/update", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({ id, name })
@@ -282,16 +282,16 @@
     }
 
     async function removeAllUsers() {
-        await fetch("/clear_users", { method: "POST" });
+        await fetch("/users/clear", { method: "POST" });
         await loadUsers();
     }
 
     async function enterAddMode() {
-        await fetch("/add_user", { method: "POST" });
+        await fetch("/users/add", { method: "POST" });
     }
 
     async function clearLogs() {
-        await fetch("/clear_logs", { method: "POST" });
+        await fetch("/logs/clear", { method: "POST" });
         await loadLogs();
     }
 
@@ -307,7 +307,7 @@
             return;
         }
 
-        const res = await fetch("/change_password", {
+        const res = await fetch("/auth/change_password", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({ current, new_password: newPass })

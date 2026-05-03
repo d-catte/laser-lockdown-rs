@@ -8,17 +8,18 @@ pub enum Command {
     /// Puts the device into "add mode"
     AddUserMode,
     /// Adds a user to the database with a default name
-    AddUser { id: u32 },
+    AddUser { id: u64 },
     /// Removes a user with the specified id from the database
-    RemoveUser { id: [u8; 32] },
+    RemoveUser { id: u64 },
     /// Updates the user data on the SD card
-    UpdateUser { id: [u8; 32], name: String<32> },
+    UpdateUser { id: u64, name: String<35> },
     /// Removes all users from the database
     RemoveAllUsers,
     /// If the user with the specified id is authorized
-    IsUser { id: [u8; 32] },
-    /// Sets a new hashed password, overriding the old one
-    SetPassword { hash: [u8; 32]},
+    IsUser { id: u64 },
+    /// Sets a new unhashed password, overriding the old one.
+    /// It will be hashed automatically
+    SetPassword { password: alloc::string::String},
     /// Logs when the user opens the door
-    LogUser { id: [u8; 32] },
+    LogUser { id: u64 },
 }

@@ -4,11 +4,11 @@ extern crate alloc;
 
 pub mod net;
 pub mod ntp;
-pub mod rfid;
-pub mod sd;
 pub mod sd_utils;
 pub mod signals;
 pub mod wifi;
+pub mod rfid;
+pub mod sd;
 
 #[macro_export]
 macro_rules! mk_static {

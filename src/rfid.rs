@@ -1,72 +1,63 @@
-use embassy_time::{Duration, Instant, Timer};
-use embedded_io::Read;
+use embassy_futures::select::{select, Either};
+use embassy_time::{with_timeout, Duration};
+use esp_hal::gpio::Input;
+use esp_println::println;
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct RFIDData {
-    pub raw: [u8; 5],
-    pub valid: bool,
+pub struct HIDReader<'a> {
+    d0: Input<'a>,
+    d1: Input<'a>,
 }
 
-pub struct SeeedRfid<UART> {
-    uart: UART,
-    data: RFIDData,
-    refresh_freq: Duration,
-    last_scan: Instant,
-}
-
-impl<UART> SeeedRfid<UART>
-where
-    UART: Read,
-{
-    pub fn new(uart: UART, refresh_freq: Duration) -> Self {
+impl<'a> HIDReader<'a> {
+    pub fn new(d0_pin: Input<'a>, d1_pin: Input<'a>) -> Self {
         Self {
-            uart,
-            data: RFIDData::default(),
-            refresh_freq,
-            last_scan: Instant::MIN,
+            d0: d0_pin,
+            d1: d1_pin,
         }
     }
 
-    /// Blocking read of one RFID frame
-    pub async fn read(&mut self) -> Option<u32> {
-        self.wait_for_scan_window().await;
-        let mut buffer = [0u8; 5];
+    pub async fn read_card(&mut self) -> u64 {
+        loop {
+            let mut bits: u64 = 0;
+            let mut count: u8 = 0;
 
-        if self.uart.read(buffer.as_mut()).is_err() {
-            return None;
+            let first_bit = select(
+                self.d0.wait_for_rising_edge(),
+                self.d1.wait_for_rising_edge()
+            ).await;
+            println!("Bit detected");
+
+            match first_bit {
+                Either::First(_) => { bits <<= 1; count += 1; }
+                Either::Second(_) => { bits = (bits << 1) | 1; count += 1; }
+            }
+
+            while count < 35 {
+                let bit = with_timeout(
+                    Duration::from_millis(50),
+                    select(self.d0.wait_for_rising_edge(), self.d1.wait_for_rising_edge())
+                ).await;
+
+                match bit {
+                    Ok(Either::First(_)) => {
+                        bits <<= 1;
+                        count += 1;
+                    }
+                    Ok(Either::Second(_)) => {
+                        bits = (bits << 1) | 1;
+                        count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if count == 35 {
+                let card_id = (bits >> 1) & 0x1FFFFF;
+                println!("Read ID: {}", card_id);
+                return card_id;
+            } else if count > 0 {
+                println!("Incomplete reading card: {} bits collected", count);
+            }
         }
-
-        if Self::check_checksum(&buffer) {
-            self.data.raw = buffer;
-            self.data.valid = true;
-            Some(Self::card_number(&buffer))
-        } else {
-            self.data.valid = false;
-            None
-        }
-    }
-
-    async fn wait_for_scan_window(&self) {
-        let now = Instant::now();
-        let next_allowed = self.last_scan + self.refresh_freq;
-
-        if now < next_allowed {
-            Timer::after(next_allowed - now).await;
-        }
-    }
-
-    fn check_checksum(data: &[u8; 5]) -> bool {
-        data[4] == (data[0] ^ data[1] ^ data[2] ^ data[3])
-    }
-
-    fn card_number(data: &[u8; 5]) -> u32 {
-        ((data[0] as u32) << 24)
-            | ((data[1] as u32) << 16)
-            | ((data[2] as u32) << 8)
-            | (data[3] as u32)
-    }
-
-    pub fn raw_data(&self) -> RFIDData {
-        self.data
     }
 }
