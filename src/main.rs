@@ -31,16 +31,25 @@ use esp_hal::{
     spi::master::{Config as SpiMasterConfig, Spi as SpiMaster},
 };
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{AnyPin, Pin};
+use esp_hal::gpio::{AnyPin, DriveMode, Pin};
 use esp_println::println;
 use esp_rtos::embassy::Executor;
 use heapless::String;
 use laser_lockdown_rs::signals::Command;
-use laser_lockdown_rs::{net, ntp, sd_utils};
+use laser_lockdown_rs::{buzzer, net, ntp, sd_utils};
 use static_cell::StaticCell;
 use laser_lockdown_rs::rfid::HIDReader;
 use laser_lockdown_rs::sd::{SdStorage};
 use laser_lockdown_rs::sd_utils::{retry_with_backoff, DummyTimeSource};
+use esp_hal::{
+    ledc::{
+        channel::{self, config::Config as ChannelConfig},
+        timer::{self, config::Config as TimerConfig},
+        LSGlobalClkSource, LowSpeed, Ledc,
+    },
+};
+use esp_hal::ledc::channel::ChannelIFace;
+use esp_hal::ledc::timer::TimerIFace;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -353,10 +362,18 @@ async fn sd(
     }
 }
 
+#[embassy_executor::task]
+pub async fn play_fight_song_task(
+    mut timer: timer::Timer<'static, LowSpeed>,
+    channel: channel::Channel<'static, LowSpeed>,
+) {
+   buzzer::play_fight_song(channel, &mut timer).await;
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     // Setup
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let mut peripherals = esp_hal::init(esp_hal::Config::default());
 
     // Init PSRAM as heap
     esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
@@ -376,6 +393,23 @@ async fn main(spawner: Spawner) {
 
     esp_println::logger::init_logger(log::LevelFilter::Info);
     println!("Initialized logger");
+
+    // TODO Play fight song during setup
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    let mut timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    timer.configure(TimerConfig {
+        duty: timer::config::Duty::Duty10Bit, // 10-bit resolution (0-1023)
+        clock_source: timer::LSClockSource::APBClk,
+        frequency: Rate::from_hz(50),
+    }).unwrap();
+    let mut channel = ledc.channel(channel::Number::Channel0, peripherals.GPIO4.reborrow());
+    channel.configure(ChannelConfig {
+        timer: &timer,
+        duty_pct: 50,
+        drive_mode: DriveMode::PushPull,
+    }).unwrap();
+    spawner.spawn(play_fight_song_task(timer, channel)).unwrap();
 
     // Init HTML
     let data = Box::leak(alloc::string::String::from(include_str!("index.html")).into_boxed_str());

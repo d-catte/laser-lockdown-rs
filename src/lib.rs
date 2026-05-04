@@ -9,6 +9,7 @@ pub mod signals;
 pub mod wifi;
 pub mod rfid;
 pub mod sd;
+pub mod buzzer;
 
 #[macro_export]
 macro_rules! mk_static {
