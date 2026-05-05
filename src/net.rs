@@ -5,7 +5,6 @@ use alloc::vec;
 use crate::{sd, sd_utils};
 use crate::signals::Command;
 use core::fmt::{Display, Formatter, Write};
-use core::str::FromStr;
 use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -15,7 +14,7 @@ use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::sha::Sha256;
 use heapless::{String, Vec};
 use nb::block;
-use picoserve::extract::{FailedToExtractEntireBodyAsStringError, Form, FromRequest};
+use picoserve::extract::{FailedToExtractEntireBodyAsStringError, FromRequest};
 use picoserve::io::Read;
 use picoserve::request::{ReadAllBodyError, RequestBody, RequestParts};
 use picoserve::response::{
@@ -23,12 +22,13 @@ use picoserve::response::{
 };
 use picoserve::routing::{get_service, PathRouter};
 use picoserve::{Config, ResponseSent, Router};
+use picoserve::response::chunked::{ChunkWriter, ChunkedResponse, Chunks, ChunksWritten};
 use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 
 pub static USERS: OnceLock<Mutex<CriticalSectionRawMutex, Vec<UserInfo, 32>>> = OnceLock::new();
 pub static LOGS: OnceLock<Mutex<CriticalSectionRawMutex, String<{ sd::LOG_PACKET_CHAR_COUNT}>>> = OnceLock::new();
-pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, alloc::string::String>> = OnceLock::new();
+pub static PSWD: OnceLock<Mutex<CriticalSectionRawMutex, u64>> = OnceLock::new();
 const SALT_STR: &str = env!("SALT");
 pub const SALT: [u8; 16] = {
     let bytes = SALT_STR.as_bytes();
@@ -101,9 +101,33 @@ fn auth_router<S>() -> Router<impl PathRouter<S>, S> {
         .route("/change_password", picoserve::routing::post(change_password))
 }
 
+struct LogChunks;
+
+impl Chunks for LogChunks {
+    fn content_type(&self) -> &'static str {
+        "text/plain"
+    }
+
+    async fn write_chunks<W: picoserve::io::Write>(
+        self,
+        mut chunk_writer: ChunkWriter<W>,
+    ) -> Result<ChunksWritten, W::Error> {
+        let logs_guard = LOGS.get().await.lock().await;
+
+        if !logs_guard.is_empty() {
+            chunk_writer.write_chunk(logs_guard.as_bytes()).await?;
+        } else {
+            chunk_writer.write_chunk(b"No logs available...").await?;
+        }
+
+        // 3. Finalize the chunked stream
+        chunk_writer.finalize().await
+    }
+}
+
 /// Gets the logs
 async fn get_logs(_auth: AuthenticatedUser) -> impl IntoResponse {
-    picoserve::response::Json(LOGS.get().await.lock().await.clone())
+    ChunkedResponse::new(LogChunks).into_response()
 }
 
 /// Clears the log file
@@ -164,15 +188,14 @@ async fn get_users(_auth: AuthenticatedUser) -> impl IntoResponse {
     picoserve::response::Json(users)
 }
 
-async fn login(Form(body): Form<LoginRequest>) -> impl IntoResponse {
+async fn login(picoserve::extract::Json(body): picoserve::extract::Json<LoginRequest>) -> impl IntoResponse {
     // Compute hash
     let hashed = hash_string(&body.password).await;
 
     // Compare with stored hash
     let valid = {
         let stored = PSWD.get().await.lock().await;
-        let parsed = u64::from_str(&stored).unwrap();
-        parsed == hashed
+        *stored == hashed
     };
 
     if !valid {

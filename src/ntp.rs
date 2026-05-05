@@ -99,7 +99,8 @@ impl<'a> Clock<'a> {
 
     /// Get current time
     /// Resync if older than 24h
-    pub async fn now(&mut self) -> Result<String<15>, ()> {
+    /// This does NOT account for DST
+    pub async fn now(&mut self) -> Result<String<17>, ()> {
         if Instant::now() - self.synced_at > RESYNC_INTERVAL {
             let _ = self.sync().await;
         }
@@ -107,7 +108,7 @@ impl<'a> Clock<'a> {
         let unix = ((self.base_unix + (Instant::now() - self.synced_at).as_secs()) as i64
             + 3600 * UTC_OFFSET as i64) as u64;
         let (year, month, day, hour, min) = Self::unix_to_datetime(unix);
-        let mut s: String<15> = String::new();
+        let mut s: String<17> = String::new();
         write!(
             s,
             "{:02}/{:02}/{:02} {:02}:{:02} ",
@@ -147,7 +148,7 @@ impl<'a> Clock<'a> {
 #[embassy_executor::task]
 pub async fn start_clock(
     time_request: &'static Signal<CriticalSectionRawMutex, ()>,
-    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<15>>>,
+    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<17>>>,
     stack: &'static Stack<'static>,
 ) {
     // Set clock

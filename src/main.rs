@@ -38,8 +38,9 @@ use heapless::String;
 use laser_lockdown_rs::signals::Command;
 use laser_lockdown_rs::{net, ntp, sd_utils};
 use static_cell::StaticCell;
+use laser_lockdown_rs::net::hash_string;
 use laser_lockdown_rs::rfid::HIDReader;
-use laser_lockdown_rs::sd::{SdStorage};
+use laser_lockdown_rs::sd::{FileNameEnum, SdStorage};
 use laser_lockdown_rs::sd_utils::{retry_with_backoff, DummyTimeSource};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -91,7 +92,7 @@ async fn io(
     println!("Testing LED");
     let mut indicator_led = Output::new(gpio4, Level::Low, OutputConfig::default());
     indicator_led.set_high();
-    Timer::after(Duration::from_secs(5)).await;
+    Timer::after(Duration::from_secs(1)).await;
     indicator_led.set_low();
     println!("Initialized LED");
 
@@ -99,7 +100,7 @@ async fn io(
     println!("Testing Buzzer");
     let mut buzzer = Output::new(gpio5, Level::Low, OutputConfig::default());
     buzzer.set_high();
-    Timer::after(Duration::from_secs(5)).await;
+    Timer::after(Duration::from_secs(1)).await;
     buzzer.set_low();
     println!("Initialized Buzzer");
 
@@ -122,8 +123,7 @@ async fn io(
     println!("Initialized Card Reader");
     loop {
         println!("Waiting for card");
-        let code = reader.read_card().await;
-        let card_id = code & 0xFFFF;
+        let card_id = reader.read_card().await;
         // Check if add mode is enabled
         if ADD_MODE.load(Ordering::Relaxed) {
             ADD_MODE.store(false, Ordering::Relaxed);
@@ -143,6 +143,8 @@ async fn io(
                     Timer::after(Duration::from_millis(500)).await;
                 }
                 continue;
+            } else {
+                println!("Add mode expired");
             }
         }
 
@@ -151,9 +153,11 @@ async fn io(
             let hashed_id = net::hash_id(card_id).await;
             cmd.signal(Command::IsUser { id: hashed_id });
             let user_exists = user_check.wait().await;
+            println!("User exists: {}", user_exists);
             if user_exists {
                 cmd.signal(Command::LogUser { id: hashed_id });
 
+                println!("Door Opening");
                 door_open.set_high();
                 // TODO Determine how long it takes to open/close the door
                 Timer::after(Duration::from_millis(2000)).await;
@@ -177,10 +181,12 @@ async fn io(
                         // Stop ticker
                         let mut ticker = Ticker::every(Duration::from_millis(250));
                         // Wait for door to close
+                        println!("Waiting for door to close");
                         while door_sensor.is_low() {
                             ticker.next().await;
                         }
                         // Close door
+                        println!("Door Closing");
                         door_close.set_high();
                         // TODO Determine how long it takes to open/close the door
                         Timer::after(Duration::from_millis(2000)).await;
@@ -211,7 +217,7 @@ async fn sd(
     cmd: &'static Signal<CriticalSectionRawMutex, Command>,
     user_check: &'static Signal<CriticalSectionRawMutex, bool>,
     time_request: &'static Signal<CriticalSectionRawMutex, ()>,
-    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<15>>>,
+    time_response: &'static Signal<CriticalSectionRawMutex, Option<String<17>>>,
 ) {
     // Setup SD
     // Start with low frequency for initialization
@@ -250,7 +256,7 @@ async fn sd(
 
     // Open volume 0 (main partition)
     let volume_mgr = VolumeManager::new(sdcard, DummyTimeSource);
-    let volume0 = if sd_size.is_some() {
+    let mut volume0 = if sd_size.is_some() {
         retry_with_backoff("Opening volume 0", || async {
             volume_mgr.open_volume(VolumeIdx(0))
         })
@@ -258,29 +264,34 @@ async fn sd(
     } else {
         None
     };
-    if volume0.is_some() {
+
+    // Test opening
+    if let Some(volume) = volume0.take() {
         println!("    Volume 0 opened");
+
+        {
+            let root_dir = retry_with_backoff("Opening root directory", || async {
+                volume.open_root_dir()
+            })
+                .await;
+
+            if let Some(root) = root_dir {
+                println!("    Root directory opened");
+                let _ = root.close();
+            }
+        }
+
+        let _ = volume.close();
     }
 
-    // Open root directory
-    let root_dir = if let Some(ref volume) = volume0 {
-        retry_with_backoff("Opening root directory", || async {
-            volume.open_root_dir()
-        })
-            .await
-    } else {
-        None
-    };
-    if root_dir.is_some() {
-        println!("    Root directory opened");
-    }
+
 
     // After initializing the SD card, increase the SPI frequency
     shared_spi_bus
         .borrow_mut()
         .apply_config(
             &SpiMasterConfig::default()
-                .with_frequency(Rate::from_mhz(2))
+                .with_frequency(Rate::from_mhz(10))
                 .with_mode(SpiMode::_0),
         )
         .expect("Failed to apply the second SPI configuration");
@@ -292,24 +303,39 @@ async fn sd(
 
     // Set user cache
     println!("Generating User Cache");
-    let users = sd_device.list_users();
+    let users = sd_device.list_users().await;
     let _ = net::USERS.init(Mutex::new(users));
 
     // Set log cache
     println!("Generating Log Cache");
-    let logs = sd_device.read_logs();
+    let logs = sd_device.read_logs().await;
     let confined: String<1024> = String::from_str(&logs).unwrap();
     let _ = net::LOGS.init(Mutex::new(confined));
 
     // Set password cache
     println!("Generating Password Cache");
-    let _ = net::PSWD.init(Mutex::new(sd_device.get_password()));
+    if sd_device.is_file_empty(FileNameEnum::Password) {
+        let hashed = hash_string("password").await;
+        let _ = net::PSWD.init(Mutex::new(hashed));
+    } else {
+        let _ = net::PSWD.init(Mutex::new(sd_device.get_password().await.parse().unwrap()));
+    }
+
+    // Test log file writing
+    println!("Testing Log File Writing");
+    sd_device.log_message("Device Booted".to_string(), None).await;
+    let last_line = sd_device.read_last_line(FileNameEnum::Log).await;
+    if let Some(last_line) = last_line {
+        println!("Logged: {}", last_line);
+    }
+
 
     loop {
         let cmd = cmd.wait().await;
         println!("Received SD Command");
         match cmd {
             Command::ClearLog => {
+                println!("Cleared Logs");
                 sd_device.clear_logs();
             }
             Command::AddUserMode => {
@@ -331,7 +357,7 @@ async fn sd(
             }
             Command::RemoveAllUsers => {
                 println!("Remove All Users");
-               sd_device.remove_all_users();
+               sd_device.remove_all_users().await;
             }
             Command::IsUser { id } => {
                 println!("Is User {:?}", id);
@@ -342,12 +368,14 @@ async fn sd(
                sd_device.set_password(password).await;
             }
             Command::LogUser { id } => {
+                println!("Attempting to Log User {}", id);
                 let timestamp = sd_device.get_timestamp(
                     time_request,
                     time_response,
                 ).await;
+                println!("Timestamp: {:?}", timestamp);
                 let msg = format!("Accessed: {}", id);
-                sd_device.log_message(msg, Some(timestamp));
+                sd_device.log_message(msg, Some(timestamp)).await;
             }
         }
     }
@@ -389,7 +417,7 @@ async fn main(spawner: Spawner) {
 
     static TIME_REQUEST: StaticCell<Signal<CriticalSectionRawMutex, ()>> = StaticCell::new();
     let time_request = &*TIME_REQUEST.init(Signal::new());
-    static TIME_RESPONSE: StaticCell<Signal<CriticalSectionRawMutex, Option<String<15>>>> =
+    static TIME_RESPONSE: StaticCell<Signal<CriticalSectionRawMutex, Option<String<17>>>> =
         StaticCell::new();
     let time_response = &*TIME_RESPONSE.init(Signal::new());
 

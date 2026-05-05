@@ -1,5 +1,173 @@
 <!DOCTYPE html>
 <html lang="en">
+
+<script>
+
+    /* ================= AUTH ================= */
+
+    async function login() {
+        const password = document.getElementById("password").value;
+        const errorDiv = document.getElementById("login-error");
+
+        errorDiv.innerText = ""; // clear previous error
+
+        try {
+            const res = await fetch("/auth/login", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ password })
+            });
+
+            if (res.status === 401) {
+                errorDiv.innerText = "Incorrect password.";
+                return;
+            }
+
+            if (!res.ok) {
+                errorDiv.innerText = "Server error.";
+                return;
+            }
+
+            // SUCCESS
+            document.getElementById("login-screen").style.display = "none";
+            document.body.style.overflow = "auto";
+            startConsolePolling();
+            await loadUsers();
+
+        } catch (err) {
+            errorDiv.innerText = "Login failed.";
+        }
+    }
+
+    async function logout() {
+        await fetch("/auth/logout", { method: "POST" });
+        location.reload();
+    }
+
+    /* ================= CONSOLE ================= */
+
+    function startConsolePolling() {
+        setInterval(loadLogs, 10000);
+    }
+
+    async function loadLogs() {
+        console.log("Fetching Logs");
+        const res = await fetch("/logs/");
+        console.log("Fetched Logs");
+
+        if (!res.ok) {
+            console.error("Could not load logs, retrying in 10s...");
+            return;
+        }
+
+        const text = await res.text();
+        const consoleDiv = document.getElementById("console");
+
+        consoleDiv.innerText = text;
+
+        if (text.trim().length === 0) {
+            consoleDiv.classList.add("empty");
+        } else {
+            consoleDiv.classList.remove("empty");
+        }
+
+        consoleDiv.scrollTop = consoleDiv.scrollHeight;
+    }
+
+    /* ================= USERS ================= */
+
+    async function loadUsers() {
+        const res = await fetch("/users/");
+        if (!res.ok) {
+            location.reload();
+            return;
+        }
+
+        const users = await res.json();
+        const list = document.getElementById("users-list");
+        list.innerHTML = "";
+
+        users.forEach(user => {
+            const div = document.createElement("div");
+            div.className = "user-entry";
+
+            const nameInput = document.createElement("input");
+            nameInput.value = user.name;
+            nameInput.onblur = () => updateUser(user.id, nameInput.value);
+
+            const idLabel = document.createElement("span");
+            idLabel.innerText = user.id;
+
+            const removeBtn = document.createElement("button");
+            removeBtn.innerText = "X";
+            removeBtn.onclick = () => removeUser(user.id);
+
+            div.appendChild(nameInput);
+            div.appendChild(idLabel);
+            div.appendChild(removeBtn);
+
+            list.appendChild(div);
+        });
+    }
+
+    async function removeUser(id) {
+        await fetch("/users/remove", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ id })
+        });
+        await loadUsers();
+    }
+
+    async function updateUser(id, name) {
+        await fetch("/users/update", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ id, name })
+        });
+    }
+
+    async function removeAllUsers() {
+        await fetch("/users/clear", { method: "POST" });
+        await loadUsers();
+    }
+
+    async function enterAddMode() {
+        await fetch("/users/add", { method: "POST" });
+    }
+
+    async function clearLogs() {
+        await fetch("/logs/clear", { method: "POST" });
+        await loadLogs();
+    }
+
+    /* ================= PASSWORD CHANGE ================= */
+
+    async function changePassword() {
+        const current = document.getElementById("current-pass").value;
+        const newPass = document.getElementById("new-pass").value;
+        const confirm = document.getElementById("confirm-pass").value;
+
+        if (newPass !== confirm) {
+            document.getElementById("pass-msg").innerText = "Passwords do not match.";
+            return;
+        }
+
+        const res = await fetch("/auth/change_password", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ current, new_password: newPass })
+        });
+
+        if (res.ok) {
+            document.getElementById("pass-msg").innerText = "Password updated successfully.";
+        } else {
+            document.getElementById("pass-msg").innerText = "Failed to update password.";
+        }
+    }
+
+</script>
+
 <head>
     <meta charset="UTF-8">
     <title>ESP32 Authentication Panel</title>
@@ -156,171 +324,6 @@
     </div>
 
 </div>
-
-<script>
-
-    /* ================= AUTH ================= */
-
-    async function login() {
-        const password = document.getElementById("password").value;
-        const errorDiv = document.getElementById("login-error");
-
-        errorDiv.innerText = ""; // clear previous error
-
-        try {
-            const res = await fetch("/auth/login", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({ password })
-            });
-
-            if (res.status === 401) {
-                errorDiv.innerText = "Incorrect password.";
-                return;
-            }
-
-            if (!res.ok) {
-                errorDiv.innerText = "Server error.";
-                return;
-            }
-
-            // SUCCESS
-            document.getElementById("login-screen").style.display = "none";
-            document.body.style.overflow = "auto";
-            startConsolePolling();
-            await loadUsers();
-
-        } catch (err) {
-            errorDiv.innerText = "Login failed.";
-        }
-    }
-
-    async function logout() {
-        await fetch("/auth/logout", { method: "POST" });
-        location.reload();
-    }
-
-    /* ================= CONSOLE ================= */
-
-    function startConsolePolling() {
-        setInterval(loadLogs, 10000);
-    }
-
-    async function loadLogs() {
-        const res = await fetch("/logs/");
-
-        if (!res.ok) {
-            location.reload();
-            return;
-        }
-
-        const text = await res.text();
-        const consoleDiv = document.getElementById("console");
-
-        consoleDiv.innerText = text;
-
-        if (text.trim().length === 0) {
-            consoleDiv.classList.add("empty");
-        } else {
-            consoleDiv.classList.remove("empty");
-        }
-
-        consoleDiv.scrollTop = consoleDiv.scrollHeight;
-    }
-
-    /* ================= USERS ================= */
-
-    async function loadUsers() {
-        const res = await fetch("/users/");
-        if (!res.ok) {
-            location.reload();
-            return;
-        }
-
-        const users = await res.json();
-        const list = document.getElementById("users-list");
-        list.innerHTML = "";
-
-        users.forEach(user => {
-            const div = document.createElement("div");
-            div.className = "user-entry";
-
-            const nameInput = document.createElement("input");
-            nameInput.value = user.name;
-            nameInput.onblur = () => updateUser(user.id, nameInput.value);
-
-            const idLabel = document.createElement("span");
-            idLabel.innerText = user.id;
-
-            const removeBtn = document.createElement("button");
-            removeBtn.innerText = "X";
-            removeBtn.onclick = () => removeUser(user.id);
-
-            div.appendChild(nameInput);
-            div.appendChild(idLabel);
-            div.appendChild(removeBtn);
-
-            list.appendChild(div);
-        });
-    }
-
-    async function removeUser(id) {
-        await fetch("/users/remove", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ id })
-        });
-        await loadUsers();
-    }
-
-    async function updateUser(id, name) {
-        await fetch("/users/update", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ id, name })
-        });
-    }
-
-    async function removeAllUsers() {
-        await fetch("/users/clear", { method: "POST" });
-        await loadUsers();
-    }
-
-    async function enterAddMode() {
-        await fetch("/users/add", { method: "POST" });
-    }
-
-    async function clearLogs() {
-        await fetch("/logs/clear", { method: "POST" });
-        await loadLogs();
-    }
-
-    /* ================= PASSWORD CHANGE ================= */
-
-    async function changePassword() {
-        const current = document.getElementById("current-pass").value;
-        const newPass = document.getElementById("new-pass").value;
-        const confirm = document.getElementById("confirm-pass").value;
-
-        if (newPass !== confirm) {
-            document.getElementById("pass-msg").innerText = "Passwords do not match.";
-            return;
-        }
-
-        const res = await fetch("/auth/change_password", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ current, new_password: newPass })
-        });
-
-        if (res.ok) {
-            document.getElementById("pass-msg").innerText = "Password updated successfully.";
-        } else {
-            document.getElementById("pass-msg").innerText = "Failed to update password.";
-        }
-    }
-
-</script>
 
 </body>
 </html>
